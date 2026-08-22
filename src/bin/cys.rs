@@ -364,6 +364,15 @@ enum Command {
         /// force 설치(init-pack --force) 기준으로 판정
         #[arg(long)]
         force: bool,
+        /// 로컬 소스 디렉터리(pack.tar.gz + pack-manifest.json + pack-manifest.json.minisig) — 생략 시 내장 팩 대상
+        #[arg(long)]
+        from: Option<String>,
+        /// 원격 manifest URL (부차 — staging에 fetch; from/manifest_url 둘 다 없으면 내장 팩 대상·기존 동작)
+        #[arg(long)]
+        manifest_url: Option<String>,
+        /// 안정 파싱용 PACK_PLAN_RESULT_JSON 라인 추가 출력
+        #[arg(long)]
+        json: bool,
     },
     /// 커스터마이즈 병합 — 병합 대기 원장(.merge-pending.json)의 신버전(.new)·보존본(.user)을 검토·해소
     #[command(name = "pack-merge")]
@@ -386,6 +395,9 @@ enum Command {
         /// 확인 프롬프트 없이 적용
         #[arg(long)]
         yes: bool,
+        /// 병합 대기(new-pending) 전체를 배치 해소(heal 카테고리는 제외) — file 무시
+        #[arg(long)]
+        all: bool,
     },
     /// pro 라이선스("열쇠") 관리 — 검증·설치·typed 진단 (DESIGN-pro-license.md §7)
     License {
@@ -1815,9 +1827,11 @@ fn run(command: Command) -> i32 {
         Command::PackUpdate { from, manifest_url, dry_run } => {
             return run_pack_update(from, manifest_url, dry_run);
         }
-        Command::PackPlan { force } => return run_pack_plan(force),
-        Command::PackMerge { file, take_new, keep_mine, ai, to_local, yes } => {
-            return run_pack_merge(file, take_new, keep_mine, ai, to_local, yes);
+        Command::PackPlan { force, from, manifest_url, json } => {
+            return run_pack_plan(force, from, manifest_url, json);
+        }
+        Command::PackMerge { file, take_new, keep_mine, ai, to_local, yes, all } => {
+            return run_pack_merge(file, take_new, keep_mine, ai, to_local, yes, all);
         }
 
         Command::PackManifest { key_id, signed_at, expires_at, min_binary_version, pack_version } => {
@@ -6617,7 +6631,57 @@ fn consume_reinject_pending(base: &std::path::Path) -> Result<(usize, usize), St
 /// `cys pack-update` 진입점(§2-② 전체 흐름). --from(핵심)·--manifest-url(부차).
 /// ④ 투명성: 내장 팩 반영 드라이런 — install_into 와 **같은 판정 함수**(pack::decide_file_action)를
 /// 쓰는 pack::plan_install 로 갱신/보존/치유/병합대기/정리를 설치 전에 보여준다(쓰기 0·플랜≠실제 드리프트 0).
-fn run_pack_plan(force: bool) -> i32 {
+/// §3-(1)-3-1 절 항목별 섹션 출력(로컬/원격 플랜 공용 — 동일 분류 표시 규약).
+fn print_plan_section(title: &str, rels: &[String], note: &str) {
+    if rels.is_empty() {
+        return;
+    }
+    println!("\n{title} ({}건){}", rels.len(), if note.is_empty() { String::new() } else { format!(" — {note}") });
+    for r in rels {
+        println!("  {r}");
+    }
+}
+
+fn print_plan_sections(plan: &cys::pack::InstallPlan) {
+    print_plan_section("🔄 자동 갱신", &plan.update, "비수정 — 그대로 갱신됨");
+    print_plan_section("✨ 신규 생성", &plan.create, "");
+    print_plan_section("🛠 강제 치유", &plan.heal, "system 수정본 — 덮기 전 사용자본을 <파일>.user 로 보존");
+    print_plan_section("⏸ 보존+병합 대기", &plan.merge_new, "user-owned 수정본 유지 + 신버전 <파일>.new 병치 → cys pack-merge");
+    print_plan_section("🔒 보존", &plan.keep_user, "user-owned 수정본 — 건드리지 않음");
+    print_plan_section("🗑 정리(폐기 파일)", &plan.prune_delete, "임베드에서 제거된 비수정 파일");
+    print_plan_section("🗑→🔒 폐기지만 보존", &plan.prune_keep_modified, "수정본이라 삭제하지 않음");
+    println!("\n= 변화 없음(최신) {}건", plan.unchanged);
+}
+
+/// PACK_PLAN_RESULT_JSON 페이로드(REINJECT_RESULT_PREFIX 패턴과 동일 원칙 — 안정 파싱용 1줄).
+fn plan_json_line(pack_version: &str, gate: &str, plan: &cys::pack::InstallPlan) -> String {
+    let v = serde_json::json!({
+        "gate": gate,
+        "pack_version": pack_version,
+        "update": plan.update,
+        "create": plan.create,
+        "heal": plan.heal,
+        "merge_new": plan.merge_new,
+        "keep_user": plan.keep_user,
+        "prune_delete": plan.prune_delete,
+        "prune_keep_modified": plan.prune_keep_modified,
+        "unchanged": plan.unchanged,
+        "blocked": plan.blocked,
+    });
+    format!("{} {v}", cys::pack::PACK_PLAN_RESULT_PREFIX)
+}
+
+fn run_pack_plan(force: bool, from: Option<String>, manifest_url: Option<String>, json: bool) -> i32 {
+    if from.is_none() && manifest_url.is_none() {
+        return run_pack_plan_embedded(force, json);
+    }
+    run_pack_plan_remote(force, from, manifest_url, json)
+}
+
+/// 하위호환 핵심 경로 — from/manifest_url 모두 None일 때만 호출된다. 기존 `cys pack-plan`
+/// 출력·종료코드를 100% 그대로 유지한다(§4-1 회귀 대상). json=true일 때만 마지막에
+/// PACK_PLAN_RESULT_JSON 한 줄을 추가로 찍는다(기본 false라 뜻밖의 출력 변경 없음).
+fn run_pack_plan_embedded(force: bool, json: bool) -> i32 {
     let dir = cys::pack::pack_dir();
     let items: Vec<(&str, &str)> = cys::pack::PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
     let plan = cys::pack::plan_install(&dir, &items, force, env!("CARGO_PKG_VERSION"));
@@ -6625,30 +6689,113 @@ fn run_pack_plan(force: bool) -> i32 {
         println!("⛔ 설치 차단: {reason}");
         return 1;
     }
-    let section = |title: &str, rels: &[String], note: &str| {
-        if rels.is_empty() {
-            return;
-        }
-        println!("\n{title} ({}건){}", rels.len(), if note.is_empty() { String::new() } else { format!(" — {note}") });
-        for r in rels {
-            println!("  {r}");
-        }
-    };
     println!("팩 반영 플랜 (대상: {} · 바이너리 {} · 쓰기 없음)", dir.display(), env!("CARGO_PKG_VERSION"));
-    section("🔄 자동 갱신", &plan.update, "비수정 — 그대로 갱신됨");
-    section("✨ 신규 생성", &plan.create, "");
-    section("🛠 강제 치유", &plan.heal, "system 수정본 — 덮기 전 사용자본을 <파일>.user 로 보존");
-    section("⏸ 보존+병합 대기", &plan.merge_new, "user-owned 수정본 유지 + 신버전 <파일>.new 병치 → cys pack-merge");
-    section("🔒 보존", &plan.keep_user, "user-owned 수정본 — 건드리지 않음");
-    section("🗑 정리(폐기 파일)", &plan.prune_delete, "임베드에서 제거된 비수정 파일");
-    section("🗑→🔒 폐기지만 보존", &plan.prune_keep_modified, "수정본이라 삭제하지 않음");
-    println!("\n= 변화 없음(최신) {}건", plan.unchanged);
+    print_plan_sections(&plan);
     let pending = cys::pack::load_merge_pending(&dir);
     if !pending.is_empty() {
         println!("※ 기존 병합 대기 {}건 — `cys pack-merge` 로 검토", pending.len());
     }
     println!("※ 사용자 전용 오버레이(~/.cys/local — 디렉티브 append·스킬 shadowing·훅 후행)는 업데이트가 절대 건드리지 않음");
+    if json {
+        println!("{}", plan_json_line(env!("CARGO_PKG_VERSION"), "embed", &plan));
+    }
     0
+}
+
+/// §3-(1)-3-1 절 원격/임의 소스 경로 — `--from`(로컬 디렉터리) 또는 `--manifest-url`(원격)을
+/// pack_update_from_dir(do_apply=false)로 검증만 하고(§0-#10 dry-run 안전 경로 재사용),
+/// gate==Apply면 staging 트리를 plan_install(§0-#9 소스 비의존)로 분류해 로컬과 동일하게 표시한다.
+fn run_pack_plan_remote(force: bool, from: Option<String>, manifest_url: Option<String>, json: bool) -> i32 {
+    let result = (|| -> Result<i32, String> {
+        let base = pack_state_base();
+        let staging = base.join(".pack-staging");
+        let lock_path = base.join(".pack-apply.lock");
+        let accepted_path = base.join(".pack-accepted.json");
+
+        let from_dir: std::path::PathBuf = match (from, manifest_url) {
+            (Some(d), _) => std::path::PathBuf::from(d),
+            (None, Some(url)) => fetch_remote_pack(&url, &base)?,
+            (None, None) => return Err("--from <dir> 또는 --manifest-url <url> 필요".into()),
+        };
+
+        let now_unix = chrono::Utc::now().timestamp();
+        let running = env!("CARGO_PKG_VERSION");
+        let keyring = cys::packsig::embedded_keyring()?;
+        let outcome = pack_update_from_dir(
+            &from_dir,
+            &staging,
+            &lock_path,
+            &accepted_path,
+            now_unix,
+            running,
+            &keyring,
+            false, // pack-plan은 항상 dry-run — 반영은 pack-update 몫
+        )?;
+
+        let gate_label = match outcome.gate {
+            VersionGate::UpToDate => "up_to_date",
+            VersionGate::BinaryTooOld => "binary_too_old",
+            VersionGate::Apply => "apply",
+        };
+
+        match outcome.gate {
+            VersionGate::UpToDate => {
+                println!(
+                    "[pack-plan] 이미 최신 — 반영 대상 없음 (remote {} ≤ 디스크). 플랜 불필요.",
+                    outcome.pack_version
+                );
+                if json {
+                    println!("{}", plan_json_line(&outcome.pack_version, gate_label, &cys::pack::InstallPlan::default()));
+                }
+                return Ok(0);
+            }
+            VersionGate::BinaryTooOld => {
+                eprintln!(
+                    "[pack-plan] 거부 — 팩 {}이 더 새 바이너리를 요구한다(min_binary > 실행 {running}).",
+                    outcome.pack_version
+                );
+                if json {
+                    println!("{}", plan_json_line(&outcome.pack_version, gate_label, &cys::pack::InstallPlan::default()));
+                }
+                return Ok(1);
+            }
+            VersionGate::Apply => {}
+        }
+
+        // gate==Apply: staging엔 검증된 파일트리가 남아있다(do_apply=false — §0-#10). 메모리로
+        // 옮긴 뒤 삭제해 dry-run 계약(pack_dir엔 쓰기 0)을 유지한다.
+        let tree = collect_tree(&staging)?;
+        let _ = std::fs::remove_dir_all(&staging);
+        let items: Vec<(&str, &str)> = tree.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
+        let dir = cys::pack::pack_dir();
+        let plan = cys::pack::plan_install(&dir, &items, force, &outcome.pack_version);
+        if let Some(reason) = &plan.blocked {
+            println!("⛔ 설치 차단: {reason}");
+            return Ok(1);
+        }
+        println!(
+            "팩 반영 플랜 (대상: {} · 원격 팩버전 {} · 쓰기 없음)",
+            dir.display(),
+            outcome.pack_version
+        );
+        print_plan_sections(&plan);
+        let pending = cys::pack::load_merge_pending(&dir);
+        if !pending.is_empty() {
+            println!("※ 기존 병합 대기 {}건 — `cys pack-merge` 로 검토", pending.len());
+        }
+        println!("※ 사용자 전용 오버레이(~/.cys/local — 디렉티브 append·스킬 shadowing·훅 후행)는 업데이트가 절대 건드리지 않음");
+        if json {
+            println!("{}", plan_json_line(&outcome.pack_version, gate_label, &plan));
+        }
+        Ok(0)
+    })();
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
 }
 
 /// ③ 커스터마이즈 병합: 병합 대기 원장 목록·해소. 해소 경로 4종 —
@@ -6663,9 +6810,48 @@ fn run_pack_merge(
     ai: bool,
     to_local: bool,
     yes: bool,
+    all: bool,
 ) -> i32 {
     let dir = cys::pack::pack_dir();
     let mut pending = cys::pack::load_merge_pending(&dir);
+
+    if all {
+        // §3-(1)-3-2: new-pending 전체 배치 해소. heal 카테고리는 제외(오너 결정 확정 — §0-#12).
+        let rels: Vec<String> = pending
+            .iter()
+            .filter(|(_, e)| e.get("kind").and_then(|v| v.as_str()) == Some("new-pending"))
+            .map(|(r, _)| r.clone())
+            .collect();
+        let pack_version = std::fs::read_to_string(dir.join(".pack-version"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let mut merged = 0usize;
+        let mut failed = 0usize;
+        let mut kept_pending = 0usize;
+        for rel in &rels {
+            let rc = resolve_merge_entry(
+                &dir, &mut pending, rel, "new-pending", take_new, keep_mine, ai, to_local, yes,
+            );
+            if !pending.contains_key(rel) {
+                merged += 1;
+            } else if rc != 0 {
+                // 자동 병합 불가(충돌/도구 부재) 등 — 침묵 처리 금지, pending 유지 + 실패로 집계.
+                failed += 1;
+            } else {
+                kept_pending += 1;
+            }
+        }
+        println!(
+            "배치 병합 완료: 대상 {}건 — {merged} 병합, {failed} 실패(pending 유지), {kept_pending} 보류(pending 유지).",
+            rels.len()
+        );
+        println!(
+            "{} pack_version={pack_version} merged={merged} failed={failed} kept_pending={kept_pending}",
+            cys::pack::MERGE_RESULT_PREFIX
+        );
+        return if failed > 0 { 1 } else { 0 };
+    }
+
     let Some(rel) = file else {
         // 목록 모드
         if pending.is_empty() {
@@ -6694,11 +6880,30 @@ fn run_pack_merge(
         eprintln!("'{rel}' 은 병합 대기 목록에 없음 — `cys pack-merge` 로 목록 확인");
         return 1;
     };
-    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-    let target = dir.join(&rel);
+    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    resolve_merge_entry(&dir, &mut pending, &rel, &kind, take_new, keep_mine, ai, to_local, yes)
+}
+
+/// 단일 병합 대기 항목 해소 — file 모드·--all 배치 모드 공용(§3-(1)-3-2, 로직 재사용). 해소 경로
+/// 4종: --take-new(신버전 채택) · --keep-mine(내 수정 유지·이번 신버전 소화) · diff3/--ai 3-way
+/// 병합(base=.pristine 조상) · --to-local(healed system 파일을 오버레이로 이동). system(healed)
+/// 파일은 rel 로 되쓰기 금지 — 다음 기동 install 이 다시 치유(P0-4)하므로 지원 경로는
+/// to-local(스킬 shadowing)뿐임을 명시한다.
+fn resolve_merge_entry(
+    dir: &std::path::Path,
+    pending: &mut serde_json::Map<String, serde_json::Value>,
+    rel: &str,
+    kind: &str,
+    take_new: bool,
+    keep_mine: bool,
+    ai: bool,
+    to_local: bool,
+    yes: bool,
+) -> i32 {
+    let target = dir.join(rel);
     let embed_now: Option<&str> = cys::pack::PACK_ALL
         .iter()
-        .find(|(r, _)| *r == rel.as_str())
+        .find(|(r, _)| *r == rel)
         .map(|(_, c)| *c);
     let confirm = |prompt: &str| -> bool {
         if yes {
@@ -6713,8 +6918,8 @@ fn run_pack_merge(
     };
     // 원장·병치 파일 해소 공통부.
     let resolve = |pending: &mut serde_json::Map<String, serde_json::Value>, side_suffix: &str| {
-        pending.remove(&rel);
-        cys::pack::save_merge_pending(&dir, pending);
+        pending.remove(rel);
+        cys::pack::save_merge_pending(dir, pending);
         let _ = std::fs::remove_file(dir.join(format!("{rel}{side_suffix}")));
     };
     // user-owned 해소 시 매니페스트 base 전진(같은 vendor 버전으로 .new 재병치 방지).
@@ -6724,7 +6929,7 @@ fn run_pack_merge(
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        m.insert(rel.clone(), cys::pack::content_hash_pub(content));
+        m.insert(rel.to_string(), cys::pack::content_hash_pub(content));
         if let Ok(json) = serde_json::to_string_pretty(&m) {
             let _ = cys::pack::write_atomic(&mpath, json.as_bytes());
         }
@@ -6738,7 +6943,7 @@ fn run_pack_merge(
                     Some(c) => c.to_string(),
                     None => {
                         eprintln!("{rel}.new 부재 + 임베드에도 없음 — 원장만 정리");
-                        resolve(&mut pending, ".new");
+                        resolve(&mut *pending, ".new");
                         return 0;
                     }
                 },
@@ -6751,22 +6956,22 @@ fn run_pack_merge(
                         return 1;
                     }
                     advance_manifest_base(&theirs);
-                    resolve(&mut pending, ".new");
+                    resolve(&mut *pending, ".new");
                     println!("✅ {rel} ← vendor 신버전 채택");
                 }
                 return 0;
             }
             if keep_mine {
                 advance_manifest_base(&theirs); // 이번 신버전은 '본 것'으로 — vendor 재전진 시에만 재병치
-                resolve(&mut pending, ".new");
+                resolve(&mut *pending, ".new");
                 println!("✅ {rel} — 내 수정 유지(이번 vendor 신버전 해소)");
                 return 0;
             }
             // 3-way 병합: base = .pristine 조상(사용자가 fork 한 시점의 vendor 본).
-            let base_path = dir.join(cys::pack::PRISTINE_DIR).join(&rel);
+            let base_path = dir.join(cys::pack::PRISTINE_DIR).join(rel);
             let base = std::fs::read_to_string(&base_path).ok();
             let merged: Option<String> = if ai {
-                ai_three_way_merge(&rel, base.as_deref(), &ours, &theirs)
+                ai_three_way_merge(rel, base.as_deref(), &ours, &theirs)
             } else {
                 diff3_merge(base.as_deref(), &ours, &theirs)
             };
@@ -6774,7 +6979,7 @@ fn run_pack_merge(
                 Some(m) if m == ours => {
                     println!("병합 결과 = 현재 내 수정본과 동일(vendor 변경이 이미 반영됨) — 해소만 수행");
                     advance_manifest_base(&theirs);
-                    resolve(&mut pending, ".new");
+                    resolve(&mut *pending, ".new");
                     0
                 }
                 Some(m) => {
@@ -6787,9 +6992,9 @@ fn run_pack_merge(
                         }
                         advance_manifest_base(&theirs);
                         // 병합본의 새 조상 = 이번 vendor 본(다음 3-way 정확성).
-                        let _ = std::fs::create_dir_all(base_path.parent().unwrap_or(&dir));
+                        let _ = std::fs::create_dir_all(base_path.parent().unwrap_or(dir));
                         let _ = cys::pack::write_atomic(&base_path, theirs.as_bytes());
-                        resolve(&mut pending, ".new");
+                        resolve(&mut *pending, ".new");
                         println!("✅ {rel} ← 3-way 병합 적용");
                     } else {
                         println!("보류 — 원장 유지. --take-new/--keep-mine 또는 수동 편집 후 재실행");
@@ -6813,7 +7018,7 @@ fn run_pack_merge(
             if to_local {
                 // 스킬 등 system 파일의 사용자본을 오버레이로 승격 — vendor 무결성(치유)과 공존.
                 let local_root = cys::pack::local_dir();
-                let dest = local_root.join(&rel);
+                let dest = local_root.join(rel);
                 if let Some(parent) = dest.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -6829,7 +7034,7 @@ fn run_pack_merge(
                                 skillscan_warn(skill_dir);
                             }
                         }
-                        resolve(&mut pending, ".user");
+                        resolve(&mut *pending, ".user");
                         println!(
                             "✅ {rel} 사용자본 → {} (오버레이 — 업데이트 불가침{})",
                             dest.display(),
@@ -6845,7 +7050,7 @@ fn run_pack_merge(
             } else if keep_mine || take_new {
                 // healed 의 '해소' = 보존본 정리(vendor 본 유지가 이미 디스크 상태).
                 if confirm(&format!("'{rel}' 보존본({rel}.user) 정리(vendor 본 유지 확정)?")) {
-                    resolve(&mut pending, ".user");
+                    resolve(&mut *pending, ".user");
                     println!("✅ {rel} — vendor 본 유지 확정, 보존본 정리");
                 }
                 0
@@ -9388,5 +9593,218 @@ mod tests {
         // agent 등록됐으나 아직 미관측(agent_alive=false) → skip.
         let unseen = json!({"agent": "claude", "exited": false, "agent_alive": false});
         assert!(reinject_check_should_skip_bare_shell(&unseen), "미관측 agent인데 진행");
+    }
+
+    // ── §3-(1)-3-1 pack-plan 원격 지원 (조각 A) ──────────────────────────────────
+
+    /// §4-1: `cys pack-plan`(인자 없음)은 from/manifest_url이 모두 None이면 임베드 경로
+    /// (run_pack_plan_embedded)로 라우팅되고, 기존과 동일하게 0을 반환하며 쓰기 0(pack_dir조차
+    /// 생성하지 않음 — dry-run 계약)이어야 한다. 하위호환 회귀 핀.
+    #[test]
+    fn pack_plan_no_args_routes_to_embedded_and_writes_nothing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-plan-noargs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack_dir = td.join("pack"); // 의도적으로 생성하지 않음 — 완전 신규 설치 시나리오
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack_dir);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, td.join("cysclaude"));
+
+        let rc = run_pack_plan(false, None, None, false);
+        let dir_created_by_plan = pack_dir.exists();
+
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(cys::pack::ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_CONFIG_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+
+        assert_eq!(rc, 0, "from/manifest_url 없는 기존 호출은 0 반환 유지");
+        assert!(!dir_created_by_plan, "pack-plan은 쓰기 0 — pack_dir조차 생성하지 않아야 함");
+    }
+
+    /// §4-2: 원격/임의 소스 dry-run(서명검증→staging round-trip→collect_tree) 이 만든
+    /// InstallPlan이, 동일 (rel,content) 아이템을 plan_install에 직접 먹인 결과와 동일 분류를
+    /// 내는지 검증한다(§0-#9 — plan_install은 소스 비의존이라 타르/staging 왕복이 분류를
+    /// 바꾸면 안 된다).
+    #[test]
+    fn pack_plan_remote_matches_direct_source_classification() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-plan-remote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack_dir = td.join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack_dir);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, td.join("cysclaude"));
+        // 디스크 기존 상태: soul.md는 구버전 내용으로 이미 존재(→ update 분류),
+        // directives/MASTER_DIRECTIVE.md는 없음(→ create 분류).
+        std::fs::write(pack_dir.join(".pack-version"), "0.0.1").unwrap();
+        std::fs::write(pack_dir.join("soul.md"), "SOUL v1 content\n").unwrap();
+
+        let (pk, sign) = gen_signer();
+        let kr = test_keyring("TESTKEY", &pk);
+        let from_dir = td.join("from");
+        std::fs::create_dir_all(&from_dir).unwrap();
+        let files: [(&str, &str); 2] = [
+            ("soul.md", "SOUL v2 content\n"),
+            ("directives/MASTER_DIRECTIVE.md", "MASTER v2\n"),
+        ];
+        build_signed_pack(&from_dir, &files, "TESTKEY", "1.0.0", "0.4.1", 1000, 9_000_000_000, &sign);
+
+        let staging = td.join("staging");
+        let lock = td.join(".lock");
+        let accepted = td.join(".accepted.json");
+        let outcome = pack_update_from_dir(
+            &from_dir, &staging, &lock, &accepted, 5000, "0.4.1", &kr, false,
+        )
+        .expect("dry-run 검증 실패");
+        assert_eq!(outcome.gate, VersionGate::Apply);
+        assert!(staging.exists(), "do_apply=false면 staging에 검증된 트리가 남아야 함(§0-#10)");
+
+        let tree = collect_tree(&staging).expect("collect_tree");
+        let items_remote: Vec<(&str, &str)> =
+            tree.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
+        let plan_remote = cys::pack::plan_install(&pack_dir, &items_remote, false, &outcome.pack_version);
+
+        // 직접 소스(동일 rel,content — 타르/staging 왕복 없이) — 소스 비의존성 검증.
+        let items_direct: Vec<(&str, &str)> = files.to_vec();
+        let plan_direct = cys::pack::plan_install(&pack_dir, &items_direct, false, &outcome.pack_version);
+
+        let _ = std::fs::remove_dir_all(&staging);
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(cys::pack::ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_CONFIG_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+
+        let mut u1 = plan_remote.update.clone();
+        u1.sort();
+        let mut u2 = plan_direct.update.clone();
+        u2.sort();
+        assert_eq!(u1, u2, "update 분류 불일치");
+        let mut c1 = plan_remote.create.clone();
+        c1.sort();
+        let mut c2 = plan_direct.create.clone();
+        c2.sort();
+        assert_eq!(c1, c2, "create 분류 불일치");
+        assert_eq!(plan_remote.heal, plan_direct.heal, "heal 분류 불일치");
+        assert_eq!(plan_remote.merge_new, plan_direct.merge_new, "merge_new 분류 불일치");
+        assert_eq!(plan_remote.keep_user, plan_direct.keep_user, "keep_user 분류 불일치");
+        assert_eq!(plan_remote.unchanged, plan_direct.unchanged, "unchanged 분류 불일치");
+        assert!(
+            !plan_remote.update.is_empty() || !plan_remote.create.is_empty(),
+            "테스트가 무의미해지지 않도록 최소 1개 분류는 발생해야 함"
+        );
+    }
+
+    // ── §3-(1)-3-2 pack-merge --all 배치 (조각 B) ────────────────────────────────
+
+    /// §4-3(성공 경로): 여러 new-pending 항목을 --all로 배치 해소하면 전부 원장에서 사라지고,
+    /// 같은 배치에 섞인 healed 항목은 손대지 않는다(§0-#12 — heal은 배치 제외). ai=true(claude
+    /// 헤드리스 스폰)는 오프라인 단위테스트에 부적합해 여기서는 keep_mine 경로로 배치
+    /// 반복/집계 로직 자체를 검증한다 — --all --ai 실제 병합 제안 경로는 §4-4 GUI 실측에서 확인한다.
+    #[test]
+    fn pack_merge_all_resolves_every_new_pending_and_skips_healed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-merge-all-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack_dir = td.join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack_dir);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, td.join("cysclaude"));
+
+        let mut pending = serde_json::Map::new();
+        for rel in ["a.md", "b.md", "c.md"] {
+            std::fs::write(pack_dir.join(rel), format!("{rel} ours\n")).unwrap();
+            std::fs::write(pack_dir.join(format!("{rel}.new")), format!("{rel} theirs\n")).unwrap();
+            pending.insert(
+                rel.to_string(),
+                json!({"kind": "new-pending", "side": ".new", "version": "1.0.0"}),
+            );
+        }
+        // healed 항목 1건 — 배치에서 반드시 제외돼야 함.
+        std::fs::create_dir_all(pack_dir.join("skills")).unwrap();
+        std::fs::write(pack_dir.join("skills/z.md"), "z healed vendor\n").unwrap();
+        std::fs::write(pack_dir.join("skills/z.md.user"), "z user copy\n").unwrap();
+        pending.insert(
+            "skills/z.md".to_string(),
+            json!({"kind": "healed", "side": ".user", "version": "1.0.0"}),
+        );
+        cys::pack::save_merge_pending(&pack_dir, &pending);
+
+        let rc = run_pack_merge(None, false, true, false, false, true, true); // keep_mine=true, all=true
+        let remaining = cys::pack::load_merge_pending(&pack_dir);
+
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(cys::pack::ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_CONFIG_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+
+        assert_eq!(rc, 0, "전부 성공이면 0 반환");
+        assert_eq!(remaining.len(), 1, "new-pending 3건은 사라지고 healed 1건만 남아야 함");
+        assert!(remaining.contains_key("skills/z.md"), "healed 항목은 배치가 건드리면 안 됨");
+    }
+
+    /// §4-3(실패 경로): AI/diff3 자동 병합이 불가한(공통 조상 `.pristine` 부재 — diff3_merge가
+    /// base 없으면 즉시 None) new-pending 항목들을 --all로 돌리면 침묵 처리되지 않고 원장에
+    /// pending으로 남으며 종료코드가 실패를 반영한다(침묵 포장 금지 원칙, §0-#10~11 동형).
+    #[test]
+    fn pack_merge_all_keeps_pending_and_reports_failure_when_unresolvable() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-merge-all-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack_dir = td.join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack_dir);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, td.join("cysclaude"));
+
+        let mut pending = serde_json::Map::new();
+        for rel in ["x.md", "y.md"] {
+            std::fs::write(pack_dir.join(rel), format!("{rel} ours\n")).unwrap();
+            std::fs::write(pack_dir.join(format!("{rel}.new")), format!("{rel} theirs\n")).unwrap();
+            // .pristine/<rel> 의도적으로 생성하지 않음 — diff3_merge가 base=None으로 즉시 거부.
+            pending.insert(
+                rel.to_string(),
+                json!({"kind": "new-pending", "side": ".new", "version": "1.0.0"}),
+            );
+        }
+        cys::pack::save_merge_pending(&pack_dir, &pending);
+
+        // take_new=false, keep_mine=false, ai=false → 3-way(diff3) 경로 → base 부재로 None → 실패.
+        let rc = run_pack_merge(None, false, false, false, false, true, true);
+        let remaining = cys::pack::load_merge_pending(&pack_dir);
+
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(cys::pack::ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_CONFIG_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+
+        assert_eq!(rc, 1, "실패 건이 있으면 0으로 침묵 포장하지 않고 1 반환");
+        assert_eq!(remaining.len(), 2, "자동 병합 불가 항목은 원장에서 지워지지 않고 남아야 함");
     }
 }

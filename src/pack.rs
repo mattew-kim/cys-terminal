@@ -14,6 +14,10 @@ pub const EXIT_REINJECT_DEGRADED: i32 = 3;
 /// run_pack_update가 reinject 집계를 stdout에 구조화 출력할 때 쓰는 줄 접두사. 호출자(Tauri
 /// 브리지)가 failed/deferred를 정확히 파싱하도록 사람용 메시지와 별개의 안정 토큰으로 둔다.
 pub const REINJECT_RESULT_PREFIX: &str = "PACK_UPDATE_RESULT";
+/// run_pack_plan --json이 stdout에 찍는 안정 파싱용 줄 접두사(REINJECT_RESULT_PREFIX와 동형 원칙).
+pub const PACK_PLAN_RESULT_PREFIX: &str = "PACK_PLAN_RESULT_JSON";
+/// run_pack_merge --all이 배치 병합 집계를 stdout에 구조화 출력할 때 쓰는 줄 접두사.
+pub const MERGE_RESULT_PREFIX: &str = "MERGE_RESULT";
 
 // cysjavis-pack의 git-추적 전체 트리는 build.rs가 `git ls-files cysjavis-pack` 소싱으로
 // 컴파일 타임 자동 임베드한다(PACK_ALL — README·directives·bin·hooks·schemas·skills 등 전체). 새
