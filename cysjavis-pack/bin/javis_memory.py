@@ -30,6 +30,18 @@ import sys
 import tempfile
 import time
 
+# ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
+#   ._pth 는 표준 경로 계산을 우회해 **스크립트 폴더를 sys.path 에 넣지 않는다**
+#   (2026-07-29 Windows 0.14.4 실측: `ModuleNotFoundError: No module named 'javis_scrub'`).
+#   unix/mac 은 스크립트 폴더가 이미 sys.path[0] 이라 이 블록은 무동작(멱등).
+#   ★append 인 이유는 MAJ#1 과 동일 — **발견이 목적이지 기존 항목의 precedence 를 강등하지 않는다**
+#   (bin/ 을 stdlib 앞에 놓지 않아 미래의 이름충돌 shadowing 을 원천 차단).
+#   선례(append 형태): javis_report.py:33-34.
+#   (hooks/inject_gate.py:22 는 insert(0) + CYS_PACK_DIR 기반 경로 — 형태가 다르므로 선례 아님)
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
 # P0.2 메모리 포이즌 WARN 게이트(구현설계서 v2 §3) — javis_skillscan(같은 bin) 있으면 활성.
 #   WARN 전용: 메모리 쓰기를 절대 차단하지 않는다(생명선·자기충돌·자율주행 증류 굶주림 방지 — 성찰 B-2).
 # ★G14(cokacdir 성찰 2026-07-04): 스캐너 부재의 '조용한 fail-open' 제거 — 쓰기는 규약대로
@@ -63,9 +75,15 @@ def index_links(index_text):
             if "/" not in m.group(1) and m.group(1) != INDEX_FILE]
 
 
+# ★팩 경로 env 키의 우선순위 목록(W14 S19 · P3). Rust 정본 `src/pack.rs::PACK_DIR_ENV_KEYS`와
+#   목록·순서가 기계 대조된다(bin/tests/test_todo_shared_constants.py). 종전 3키에는
+#   `AITERM_PACK_DIR`가 빠져 있어 레거시 env 환경에서 memory 위치가 다른 도구와 갈렸다.
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
 def default_memory_dir():
-    """pack 위치 결정 — src/pack.rs pack_dir()의 폴백을 그대로 미러링한다."""
-    for key in ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_JARVIS_DIR"):
+    """pack 위치 결정 — src/pack.rs pack_dir()의 폴백(PACK_DIR_ENV_KEYS)을 그대로 미러링한다."""
+    for key in PACK_DIR_ENV_KEYS:
         v = os.environ.get(key, "")
         if v:
             return os.path.join(v, "memory")

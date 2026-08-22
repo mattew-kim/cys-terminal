@@ -34,6 +34,18 @@ import sys
 import threading
 import time
 
+# ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
+#   ._pth 는 표준 경로 계산을 우회해 **스크립트 폴더를 sys.path 에 넣지 않는다**
+#   (2026-07-29 Windows 0.14.4 실측: `ModuleNotFoundError: No module named 'javis_scrub'`).
+#   unix/mac 은 스크립트 폴더가 이미 sys.path[0] 이라 이 블록은 무동작(멱등).
+#   ★append 인 이유는 MAJ#1 과 동일 — **발견이 목적이지 기존 항목의 precedence 를 강등하지 않는다**
+#   (bin/ 을 stdlib 앞에 놓지 않아 미래의 이름충돌 shadowing 을 원천 차단).
+#   선례(append 형태): javis_report.py:33-34.
+#   (hooks/inject_gate.py:22 는 insert(0) + CYS_PACK_DIR 기반 경로 — 형태가 다르므로 선례 아님)
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
 IS_WIN = os.name == "nt"
 HERE = os.path.dirname(os.path.abspath(__file__))
 PHOENIX = os.path.join(HERE, "javis_phoenix.py")
@@ -403,7 +415,7 @@ def case7_keepalive_respawn():
         pong_ev = ("%.0fs" % pong_elapsed) if pong_elapsed is not None else "미관측"
         respawned = epoch1 is not None and epoch2 is not None and epoch1 != epoch2
         ev = "epoch %s->%s · pong복귀=%s · elapsed=%.0fs(예산 %ds)" % (epoch1, epoch2, pong_ev, elapsed, BUDGET)
-        # ★라벨 전환(박사님 승인 2026-07-05 · CI run 28736698338 vs 28737327371 실증): Task Scheduler 의
+        # ★라벨 전환(2026-07-05 · CI run 28736698338 vs 28737327371 실증): Task Scheduler 의
         #   RestartOnFailure 반응 시점은 OS 내부 사정으로 비결정(+242s 부활 vs 425s 미부활) — 실시간 관측을
         #   per-commit CI hard gate 로 두면 가짜 빨간불이 CI 신뢰를 갉는다. 예산 내 부활=PASS(경과시간 evidence),
         #   미부활=FAIL 아닌 OBSERVED-TIMEOUT 정직 라벨(능력 은폐 아님 — 검증 자리 이동: 설정·수동 /Run 재기동은

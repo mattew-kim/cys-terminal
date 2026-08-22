@@ -32,6 +32,10 @@
 
 set -u
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(pre-dispatch)" >&2; exit 0; }
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR="."
 
 # 계약 ②: stdin 1회 버퍼링
@@ -40,14 +44,16 @@ IN=$(cat)
 # ---- tool_name 추출(1스폰: jq 우선, 없으면 python3 폴백) ----
 TOOL=""
 if command -v jq >/dev/null 2>&1; then
-  TOOL=$(printf '%s' "$IN" | jq -r '.tool_name // empty' 2>/dev/null)
+  # ★CR 제거(2026-08-10 Windows 실기 H-WIN-5 동군): 네이티브 jq/python 은 \r\n — 디스패치 완전일치 보호(unix 무변).
+  TOOL=$(printf '%s' "$IN" | jq -r '.tool_name // empty' 2>/dev/null | tr -d '\r')
 fi
-if [ -z "$TOOL" ] && command -v python3 >/dev/null 2>&1; then
-  TOOL=$(printf '%s' "$IN" | python3 -c 'import sys,json
+# G22: 경성 python3 → 프리루드 해소값(python3→python→py). 미해소면 아래 UNKNOWN superset 경로.
+if [ -z "$TOOL" ] && [ -n "${CYS_PY:-}" ]; then
+  TOOL=$(printf '%s' "$IN" | "$CYS_PY" -c 'import sys,json
 try:
     d=json.load(sys.stdin); print(d.get("tool_name") or "")
 except Exception:
-    print("")' 2>/dev/null)
+    print("")' 2>/dev/null | tr -d '\r')
 fi
 # tool_name 미해석 = 파싱 실패 에러경로. 게이트를 놓치지 않도록 fail-safe superset(전 서브훅 실행).
 UNKNOWN=0

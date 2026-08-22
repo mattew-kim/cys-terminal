@@ -7,17 +7,26 @@
 # 안전: graceful, 반드시 exit 0
 set +e
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(save-state)" >&2; exit 0; }
+
 INPUT=$(cat 2>/dev/null)
-# 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다(미해소 시 graceful degrade).
-CYS_PY="$(command -v python3 || command -v python || command -v py || echo python3)"
+# 인터프리터 해소는 프리루드(python3→python→py) — 기존 계약(비어 있으면 안 됨)은 명시 폴백.
+[ -n "$CYS_PY" ] || CYS_PY="python3"
+# ★CR 제거(2026-08-10 Windows 실기 H-WIN-5): 네이티브 python 은 파이프에도 \r\n 을 쓴다 —
+#   꼬리 CR 이 cwd 상향탐색·이벤트 완전일치를 무너뜨린다(unix 무변 · inject-context 동일 규약).
 CWD=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('cwd',''))
-except Exception: print('')" 2>/dev/null)
-case "$CWD" in /*) ;; *) CWD="" ;; esac  # 절대경로만 상향탐색 (무한루프 방지)
+except Exception: print('')" 2>/dev/null | tr -d '\r')
+# G19: 드라이브/UNC 경로 정규화 후 절대경로 판정(Windows `C:\` cwd 공란화 해소·POSIX 무변경)
+CWD="$(cys_norm_cwd "$CWD")"
+cys_is_abs "$CWD" || CWD=""   # 절대경로만 상향탐색 (무한루프 방지)
 EVENT=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try:
  d=json.load(sys.stdin); print(d.get('hook_event_name', d.get('trigger','event')))
-except Exception: print('event')" 2>/dev/null)
+except Exception: print('event')" 2>/dev/null | tr -d '\r')
 
 ROOT="${CYS_ROOT:-$HOME}"
 DIR="$CWD"; RD=""; PREV=""
@@ -66,5 +75,33 @@ if [ -f "$LOG" ]; then
     tail -n "$LOG_KEEP" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG" 2>/dev/null
     echo "$NOW	rotate	.state_log>${LOG_MAX} → archive (kept ${LOG_KEEP})" >> "$LOG" 2>/dev/null
   fi
+fi
+
+# ---------- (C) BOOT_SNAPSHOT 생성 (관측 전용 · 마스터 pane 한정 · 실패 무해 · W-수리1 배선) ----------
+# 도구 부재 시 -f 가드로 조용히 생략 · 비마스터 skip 판정은 도구 내부 게이트(javis_snapshot.py) 소관.
+# 어떤 실패(타임아웃 124·미설치 127 포함)도 exit 0 보존 — 기존 write-ahead 동작 불변.
+# Windows(PortableGit sh) 패리티: 네이티브 python3는 POSIX 경로(/c/...)를 못 연다 — cygpath 변환(inject-context CHK·GATE 동일 규약).
+# ★레인 정합(경미3-1): 부서 pane(CYS_SOCKET=부서 데몬·CYS_PACK_DIR=pack-dept-*)의 스냅샷은
+#   inject-context.sh 부서 레인 선택 규약(G4+G20 술어 미러)이 읽는 $CYS_PACK_DIR/round 에 산출한다 —
+#   base/메인 _round 로 새면 격리 파괴(R2/R3). 부서 컨텍스트인데 pack round 미해소/부재면 생성 생략.
+SNAP_RD="$RD"
+_PACK_N="$(cys_norm_path "${CYS_PACK_DIR:-}")"
+_PACK_BASE="${_PACK_N%/}"; _PACK_BASE="${_PACK_BASE##*/}"
+_SOCK_N="$(cys_norm_path "${CYS_SOCKET:-}")"
+DEPT_CTX=""
+case "$_PACK_BASE" in pack-dept-?*) DEPT_CTX=1 ;; esac
+case "/$_SOCK_N" in */cys-dept-?*) DEPT_CTX=1 ;; esac
+if [ -n "$DEPT_CTX" ]; then
+  case "$_PACK_BASE" in
+    pack-dept-?*) SNAP_RD="$CYS_PACK_DIR/round" ;;
+    *)            SNAP_RD="" ;;
+  esac
+fi
+PACK_BIN="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin"
+SNAP_PY="$PACK_BIN/javis_snapshot.py"
+command -v cygpath >/dev/null 2>&1 && SNAP_PY="$(cygpath -w "$SNAP_PY" 2>/dev/null || printf '%s' "$SNAP_PY")"
+if [ -n "$SNAP_RD" ] && [ -d "$SNAP_RD" ] && [ -f "$SNAP_PY" ]; then
+  # --round-dir 도 cys_native_path 변환(_lib.sh) — 종전 SNAP_PY만 변환·RD 미변환 비대칭 해소.
+  cys_timeout_run 10 "$CYS_PY" "$SNAP_PY" generate --round-dir "$(cys_native_path "$SNAP_RD")" >/dev/null 2>&1 || true
 fi
 exit 0

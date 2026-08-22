@@ -10,9 +10,10 @@ WorldState(§4)로 정규화해 127.0.0.1 전용 HTTP(+SSE)로 내보낸다.
   · 소음 필터·코얼레싱 (§6.3) — watchdog 무시, fx 초당 상한, 알림류 중복 병합
   · 이벤트 유실 방어 — --cursor-file 로 시퀀스 영속, 재시작 시 gap 없이 재개
 
-기동:  cys run --scoped -- python3 bin/javis_hud_bridge.py
+기동:  cys run -- python3 bin/javis_hud_bridge.py
 접속:  http://127.0.0.1:8765
 """
+import glob
 import json
 import os
 import re
@@ -110,13 +111,18 @@ def pick_ctx(node):
 
 
 # ------------------------------------------------------------ 코얼레싱 (§6.3)
-NOISE_NAMES = {"watchdog.duplicate_procs", "watchdog.proc_count"}
+# watchdog.* 는 route_event 가 startswith 로 선차단·dog_fx 가 kill/alert 변환 — NOISE_NAMES 는
+# 그 외 소음용(현재 비어 있음). "watchdog.proc_count" 는 실이벤트명이 proc_count_high 라 도달불가
+# 死엔트리였으므로 제거(reviewer1 minor).
+NOISE_NAMES = set()
 ALERT_COALESCE = {  # (이벤트명 → 동일 surface 재발화 억제 윈도 s)
     "health.alert": 30.0,
     "master.deadman": 60.0,
     "pane.idle": 120.0,
     "schedule.fired": 10.0,
     "schedule.error": 30.0,
+    "watchdog.dog.kill": 10.0,    # D4 강아지 fx kill ≤1건/10s (kind별 분리 — kill 이 alert 에 안 밀림)
+    "watchdog.dog.alert": 10.0,   # D4 강아지 fx alert ≤1건/10s
 }
 FX_BUDGET_PER_SEC = 20
 
@@ -246,10 +252,80 @@ def node_key(s):
 
 
 # ------------------------------------------------------------------ 월드
-TODO_ROLE = re.compile(r"(?:^|/)(?P<r>[A-Z_]+)_TODO\.md$")
+# ★W14 S16 — 파일명 정규식이 **숫자·하이픈을 통째로 탈락**시켰다. 종전 `[A-Z_]+`는
+# `WORKER_2_TODO.md`·`REVIEWER-GEMINI_TODO.md`를 아예 매치하지 못해 HUD에서 **표시 자체가
+# 사라졌다**. 둘 다 실재 형태다 — `cys todo-path`가 role `worker-2`에 대해 실제로 만드는
+# 이름이고, 하이픈판은 손기동 산출물로 실측된다. 문자집합을 role 라벨공간에 맞춘다.
+TODO_ROLE = re.compile(r"(?:^|/)(?P<r>[A-Za-z0-9_-]+)_TODO\.md$")
+# 파일명 → role 라벨 정규화는 **소문자화 + 언더스코어→하이픈** 한 규칙이다
+# (`javis_report.node_label`·`javis_todo_stamp.owner_from_filename`과 **같은 규칙**).
+# 종전의 하드코딩 dict는 이 규칙과 결과가 동일하면서 새 역할이 생길 때마다 조용히
+# 누락되는 표면만 늘렸다 — 규칙 하나로 수렴시킨다.
 TODO_ROLE_MAP = {"MASTER": "master", "WORKER": "worker", "CSO": "cso",
                  "REVIEWER_GEMINI": "reviewer-gemini", "REVIEWER_AGY": "reviewer-agy",
                  "REVIEWER_CODEX": "reviewer-codex"}
+
+
+def normalize_role_label(raw):
+    """role 라벨공간(소문자·하이픈)으로 수렴시킨다. 빈 값이면 None.
+
+    ⚠라벨은 게이트·HUD의 **조인 키**다. 한 글자만 어긋나도 조인이 조용히 전패한다
+    (`javis_report.decl_label`이 같은 이유로 같은 정규화를 한다).
+    """
+    s = (raw or "").strip().lower().replace("_", "-")
+    return s or None
+
+
+def todo_label(path, entry):
+    """이 todo 항목의 라벨 — **선언 `owner`가 1순위**, 없으면 파일명 폴백(D3 해소).
+
+    ★W14 S16 — 데몬은 `todo.updated`에 owner를 실으면서 `org.status`에는 싣지 않았고,
+    브리지는 **어느 쪽도 읽지 않았다**. 그래서 선언이 소거하려던 파일명→역할 추론(D3)이
+    HUD(C4)에 그대로 생존했다 — 실측: 선언 `owner=cso`인데 HUD 라벨은 `worker`.
+    선언이 유일한 진실이라는 ADR-1이 마지막 소비자에서 지켜지지 않았다.
+
+    ⚠스큐 안전(ADR-2): 구버전 데몬은 `owner`를 싣지 않는다 → 파일명 폴백 = 종전 동작 그대로.
+    """
+    owner = normalize_role_label((entry or {}).get("owner"))
+    if owner:
+        return owner
+    m = TODO_ROLE.search(path or "")
+    if not m:
+        return None
+    raw = m.group("r")
+    return normalize_role_label(TODO_ROLE_MAP.get(raw, raw))
+
+# C4: 데몬(C2)이 실은 선언 판정 → HUD 구분 표시 라벨.
+# 집계에 남아 있는 비-counted 판정은 이 둘뿐이다 — retired·foreign-scope 는 데몬이 애초에
+# 등재하지 않는다(설계 §4-5). `counted` 와 미지 판정은 라벨을 달지 않는다.
+TODO_FLAG_BY_VERDICT = {
+    "unclaimed": "미선언",      # 선언 없음·깨짐 — 주인을 기계가 확정하지 못한 파일
+    "orphan-scope": "고아",     # 실재하지 않는 팩을 가리킴(부서 teardown·개명 흔적)
+}
+
+
+def todo_flag(entry):
+    """todo 항목(또는 todo.updated payload)의 판정 라벨. 표시할 것이 없으면 None.
+
+    ⚠**스큐 안전(ADR-2)**: 팩은 pack 채널로, 데몬은 앱 릴리스로 배송돼 **스큐가 정상 상태**다.
+    구버전 데몬은 `verdict` 를 싣지 않으므로 `.get()` 기본값으로 None → 표시·프레임이 종전과
+    완전히 동일하다. 양측은 서로를 전제하지 않는다.
+
+    ⚠**온보딩 방어(설계 §6)**: 미선언은 **경고가 아니라 정보**다. 신규 사용자가 손으로 쓴 todo 에
+    경고가 쏟아지면 첫 경험이 훼손된다 — 라벨만 달고 진행률(done/total)은 그대로 보여준다.
+    """
+    return TODO_FLAG_BY_VERDICT.get((entry or {}).get("verdict"))
+
+
+def with_todo_flag(entry):
+    """항목에 표시 라벨(`flag`)을 얹은 사본. 달 라벨이 없으면 **원본 그대로** 돌려준다
+    (구버전 데몬·정상 파일에서 프레임이 한 바이트도 달라지지 않게 하는 스큐 안전 경로)."""
+    flag = todo_flag(entry)
+    if flag is None:
+        return entry
+    out = dict(entry)
+    out["flag"] = flag
+    return out
 
 
 class World:
@@ -356,10 +432,36 @@ class World:
                     out[slug] = d.get("socket")
             return out
 
-    def apply_todo(self, path, done, total):
+    @staticmethod
+    def _todo_rank(path, entry):
+        """정본 선출 정렬 키(작을수록 우선). 상세 근거는 `snapshot`의 주석."""
+        e = entry or {}
+        done, total = e.get("done") or 0, e.get("total") or 0
+        pending = total > 0 and done < total
+        return (0 if e.get("owner") else 1,      # ① 선언 owner 보유
+                0 if pending else 1,             # ② 미완 우선(완료가 미완을 덮지 않는다)
+                e.get("age_secs") or 0,          # ③ 최신
+                path or "")                      # ④ 결정론 tie-break
+
+    def apply_todo(self, path, done, total, verdict=None, owner=None):
         with self.lock:
             ent = self.todo.setdefault(path, {})
             ent["done"], ent["total"], ent["age_secs"] = done, total, 0
+            # owner 는 신버전 데몬만 싣는 선택 필드다(ADR-2 스큐 안전 — verdict 와 같은 규칙).
+            # 부재면 기존 값을 **지우지 않는다**: 구버전 이벤트 한 건이 스냅샷의 라벨 진실을
+            # 파일명 추론으로 되돌리면 안 된다.
+            if owner:
+                ent["owner"] = owner
+            # verdict 는 신버전 데몬만 싣는 선택 필드다(ADR-2 스큐 안전). 부재면 기존 항목의
+            # 판정을 지우지 않고 그대로 둔다 — 구버전 이벤트가 스냅샷의 라벨을 지워버리면
+            # 미선언·고아가 무음으로 되돌아간다.
+            if verdict is not None:
+                ent["verdict"] = verdict
+                flag = todo_flag(ent)
+                if flag is None:
+                    ent.pop("flag", None)   # counted 로 전이 = 라벨 해제
+                else:
+                    ent["flag"] = flag
 
     def apply_ledger(self, name, payload):
         if name == "ledger.registered":
@@ -425,7 +527,9 @@ class World:
                 self.daemon = status.get("daemon") or self.daemon
                 self.daemon["paused"] = status.get("paused", False)
                 for p, t in (status.get("todo") or {}).items():
-                    self.todo[p] = t
+                    # C4: 데몬이 실은 선언 판정을 표시 라벨로 승격(미선언/고아 구분).
+                    # 플래그 부재(구버전 데몬)면 t를 그대로 둔다 — 종전과 동일 동작.
+                    self.todo[p] = with_todo_flag(t)
                 self.seq = self.daemon.get("latest_seq", self.seq)
             structural = False
             if fleet:
@@ -436,8 +540,10 @@ class World:
                             for s in d.get("surfaces", [])}
                 new_keys = {node_key(s) for d in new_deps
                             for s in d.get("surfaces", [])}
-                old_shape = [d.get("_slug") for d in self.departments]
-                new_shape = [d.get("_slug") for d in new_deps]
+                # D5: (slug, label) 튜플 비교 — display_name 개명만 바뀌어도 structural=True
+                # → 전체 재빌드 유발(층 라벨 재시작 없이 반영). 개명은 드문 이벤트, 재빌드 비용 수용.
+                old_shape = [(d.get("_slug"), d.get("_dept_label")) for d in self.departments]
+                new_shape = [(d.get("_slug"), d.get("_dept_label")) for d in new_deps]
                 structural = (old_keys != new_keys) or (old_shape != new_shape)
                 # 출력량 변화율 (line_count 델타)
                 now = time.time()
@@ -617,11 +723,22 @@ class World:
                     "floor": len(self.departments) - i,   # 첫 부서(본부)가 최상층
                     "nodes": nodes,
                 })
+            # ★W14 S16 — 라벨당 **정본 1개 선출**. 종전에는 dict 대입이라 나중에 순회된
+            # 항목이 앞의 것을 조용히 덮었고, **완료 5/5가 미완 0/2를 덮는** 것이 실측으로
+            # 재현됐다. 그 상태는 사람이 보는 화면에서 살아있는 작업을 지운다.
+            # 정렬은 `javis_report`의 정본 선출 키에서 **미완 우선**을 이식한 것이다
+            # (거기서는 `shadowed` 선출, 여기서는 표시 선출 — 같은 원리를 같은 순서로).
+            #   ① 선언 owner 보유(= 기계가 주인을 확정한 파일)
+            #   ② **미완 우선** — 살아있는 작업이 완료된 파일에 밀리지 않는다
+            #   ③ 최신(age_secs 작은 쪽) ④ 경로순(결정론 tie-break)
+            # ※ `javis_report`의 '정본위치(pack/round)' 키는 여기 대응물이 없다 — 브리지는
+            #   팩 경로를 모른다. 경로 패턴으로 추측하는 것은 ADR-1이 없애려던 그 추론이므로
+            #   넣지 않는다(누락이 아니라 의도적 부재다).
             todo_named = {}
-            for p, t in self.todo.items():
-                m = TODO_ROLE.search(p or "")
-                if m:
-                    todo_named[TODO_ROLE_MAP.get(m.group("r"), m.group("r"))] = t
+            for p, t in sorted(self.todo.items(), key=lambda kv: self._todo_rank(*kv)):
+                label = todo_label(p, t)
+                if label and label not in todo_named:
+                    todo_named[label] = t
             return {
                 "v": 2, "ts": now, "seq": self.seq,   # v2: 정식 노드 키(<slug>@surface:N)·dept_label
                 "daemon": {"version": self.daemon.get("version"),
@@ -680,6 +797,36 @@ TOOL_HOOKS = {"agent.hook.PreToolUse": "pre", "agent.hook.PostToolUse": "post",
               "agent.hook.PermissionRequest": "perm"}
 
 
+def dog_fx(name, ev, coal, now):
+    """watchdog kill/alert 이벤트 → 강아지 fx 프레임 (D4). 그 외 watchdog.* 는 차단(틱 피드 유지).
+
+    · watchdog.duplicate_procs → {t:'dog', kind:'kill', pid:<pids 첫번째 or None>, count:N}
+    · watchdog.proc_count_high → {t:'dog', kind:'alert', sid:<surface id>, count:N}
+    코얼레싱: kind별 독립 10s 창(watchdog.dog.kill / watchdog.dog.alert) — 초과분 폐기.
+    kill(실 프로세스 강제종료 사건)은 alert 창에 밀리지 않는다(각 kind 자기 창만 소비).
+    백로그(BACKLOG_FX_SECS 초과 과거 이벤트)는 억제. t:'dog' 라 구 프론트는 무시(additive·v2 유지).
+    """
+    p = ev.get("payload") or {}
+    if name == "watchdog.duplicate_procs":
+        pids = p.get("pids") if isinstance(p.get("pids"), list) else []
+        frame = {"t": "dog", "kind": "kill", "pid": pids[0] if pids else None,
+                 "count": p.get("count")}
+    elif name == "watchdog.proc_count_high":
+        frame = {"t": "dog", "kind": "alert", "sid": ev.get("surface_id"),
+                 "count": p.get("count")}
+    else:
+        return []   # tick_panic·load_high·duplicates_killed 등 그 외 watchdog.* 차단
+    ts = ev.get("timestamp") or now
+    if (now - ts) > BACKLOG_FX_SECS:
+        return []   # 과거 이벤트: 연출 억제 (콜드스타트 폭주 방지) — 백로그 판정은 epoch(now vs ts)
+    # coal.allow 는 now 를 넘기지 않는다: Coalescer 버킷·창은 monotonic 시계축이라 epoch now 를
+    # 주입하면 (epoch-monotonic ≈ +1.78e9) 매 dog 이벤트가 전역 fx 예산을 풀리필해 flood 보호가
+    # 무력화된다(reviewer1 실측). 나머지 9개 호출과 동일하게 monotonic 기본에 정렬한다.
+    if not coal.allow("watchdog.dog." + frame["kind"], "dog"):
+        return []   # kind별 코얼레싱 창 내 초과분 폐기
+    return [frame]
+
+
 def route_event(ev, world, coal, slug="main", now=None):
     """데몬 이벤트 1건 → 방출 프레임 목록 (+월드 반영). 순수 로직 (테스트 대상).
 
@@ -691,9 +838,11 @@ def route_event(ev, world, coal, slug="main", now=None):
     fx 프레임은 억제한다 — "켜는 순간"의 과거 연출 폭주 방지, 상태는 손실 0.
     """
     name = ev.get("name") or ""
-    if name in NOISE_NAMES or name.startswith("watchdog."):
-        return [], False
     now = time.time() if now is None else now
+    if name.startswith("watchdog."):
+        return dog_fx(name, ev, coal, now), False   # kill/alert 만 강아지 fx, 그 외 차단
+    if name in NOISE_NAMES:
+        return [], False
     ts = ev.get("timestamp") or now
     backlog = (now - ts) > BACKLOG_FX_SECS
     sid = ev.get("surface_id")
@@ -719,9 +868,15 @@ def route_event(ev, world, coal, slug="main", now=None):
         if k:
             frames.append({"t": "fx", "kind": "usage", "key": k, "pct": p.get("ctx_pct")})
     elif name == "todo.updated":
-        world.apply_todo(p.get("path"), p.get("done"), p.get("total"))
-        frames.append({"t": "fx", "kind": "todo", "path": p.get("path"),
-                       "done": p.get("done"), "total": p.get("total")})
+        # C4: verdict·owner 는 신버전 데몬만 싣는다(부재=구버전 → 종전 동작 · ADR-2 스큐 안전).
+        world.apply_todo(p.get("path"), p.get("done"), p.get("total"),
+                         p.get("verdict"), p.get("owner"))
+        fx = {"t": "fx", "kind": "todo", "path": p.get("path"),
+              "done": p.get("done"), "total": p.get("total")}
+        flag = todo_flag(p)
+        if flag is not None:
+            fx["flag"] = flag   # 달 라벨이 없으면 키 자체를 만들지 않는다(구버전 프레임과 동형)
+        frames.append(fx)
     elif name == "surface.input_injected":
         # from 은 동일 데몬 내 소스 surface → 같은 slug 로 정식화.
         frames.append({"t": "fx", "kind": "doc", "to": key,
@@ -1138,6 +1293,113 @@ def read_history(after_ts, limit=6000):
     return out[-limit:]
 
 
+# -------------------------------------------------- 스킬 카탈로그 (D6 · GET /skills)
+def skill_sources(home=None):
+    """스킬 스캔 소스 [(디렉토리, 계정 라벨)] 동적 탐색.
+
+    <ROOT>/skills(pack) + ~/.claude/skills(claude) + glob ~/.claude-*/skills
+    (라벨 = 디렉토리명 'claude-' 뒤 접미사). 계정 프로필을 하드코딩하지 않아 임의 계정을
+    자동 지원하며(기능 확장), 소스에 개인 핸들 리터럴이 남지 않는다(라벨은 런타임 파생).
+    """
+    home = home or os.path.expanduser("~")
+    srcs = [(os.path.join(ROOT, "skills"), "pack"),
+            (os.path.join(home, ".claude", "skills"), "claude")]
+    prefix = ".claude-"
+    for d in sorted(glob.glob(os.path.join(home, prefix + "*", "skills"))):
+        suffix = os.path.basename(os.path.dirname(d))[len(prefix):]   # .claude-<라벨>
+        srcs.append((d, suffix or "claude"))
+    return srcs
+
+
+SKILLS_CACHE_SECS = 60.0
+SKILL_DESC_MAX = 200
+_skills_cache = {"ts": 0.0, "data": None}
+_skills_lock = threading.Lock()
+_SKILL_FM_RE = re.compile(r"^\s*(name|description)\s*:\s*(.*)$")
+
+
+def parse_skill_md(path, dirname):
+    """SKILL.md → (name, description). frontmatter name/description 우선, 없으면 디렉토리명·첫 문단.
+
+    description 은 SKILL_DESC_MAX(200) 자 절단. 파일 부재·오류 시 (dirname, "").
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return dirname, ""
+    name = desc = None
+    body = text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            body = text[end + 4:]
+            for line in text[3:end].splitlines():
+                m = _SKILL_FM_RE.match(line)
+                if not m:
+                    continue
+                k, v = m.group(1), m.group(2).strip()
+                if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+                    v = v[1:-1]
+                if k == "name" and v:
+                    name = v
+                elif k == "description" and v:
+                    desc = v
+    if not name:
+        name = dirname
+    if not desc:
+        for line in body.splitlines():   # 첫 문단(비어있지·헤딩·구분선 아닌 첫 줄)
+            s = line.strip()
+            if s and not s.startswith("#") and not s.startswith("---"):
+                desc = s
+                break
+        desc = desc or ""
+    return name, desc[:SKILL_DESC_MAX]
+
+
+def scan_skills(now=None, sources=None):
+    """4개 소스의 SKILL.md 스캔 → 병합 스킬 목록 {"skills":[{name,description,accounts}]}.
+
+    동일 name 은 accounts 병합(마스터·워커 계정 스킬 편차 표기). 60s 캐시(시각 비교) —
+    sources 명시(테스트) 시 캐시 우회. 각 소스는 하위 디렉토리의 SKILL.md 만 채택('_'·'.' 접두 skip).
+    """
+    now = time.time() if now is None else now
+    use_cache = sources is None
+    srcs = skill_sources() if sources is None else sources
+    if use_cache:
+        with _skills_lock:
+            if _skills_cache["data"] is not None \
+               and (now - _skills_cache["ts"]) < SKILLS_CACHE_SECS:
+                return _skills_cache["data"]
+    merged = {}   # name → {"name","description","accounts":[...]}
+    for base, account in srcs:
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for dirname in entries:
+            if dirname.startswith("_") or dirname.startswith("."):
+                continue
+            sk = os.path.join(base, dirname, "SKILL.md")
+            if not os.path.isfile(sk):
+                continue
+            nm, desc = parse_skill_md(sk, dirname)
+            ent = merged.get(nm)
+            if ent is None:
+                merged[nm] = {"name": nm, "description": desc, "accounts": [account]}
+            else:
+                if account not in ent["accounts"]:
+                    ent["accounts"].append(account)
+                if not ent["description"] and desc:   # 앞 소스가 빈 설명이면 뒤 소스로 보강
+                    ent["description"] = desc
+    data = {"skills": sorted(merged.values(), key=lambda e: e["name"])}
+    if use_cache:
+        with _skills_lock:
+            _skills_cache["ts"] = now
+            _skills_cache["data"] = data
+    return data
+
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 
@@ -1241,7 +1503,7 @@ class SubscriptionSupervisor:
                     frames, want_poke = route_event(ev, self.world, self.coal, slug)
                     for fr in frames:
                         self.hub.publish(fr)
-                        if fr.get("t") == "fx":
+                        if fr.get("t") in ("fx", "dog"):   # D4 강아지 fx 도 /history 리플레이 포함
                             archive_fx(ev.get("timestamp"), fr)
                     if want_poke:
                         self.poke.set()
@@ -1463,6 +1725,9 @@ class Handler(BaseHTTPRequestHandler):
                 after = 0.0
             body = json.dumps({"events": read_history(after)}, ensure_ascii=False).encode()
             return self._send(200, "application/json; charset=utf-8", body)
+        if path == "/skills":   # D6: 카페 팝업스토어 진열용 스킬 카탈로그 (127.0.0.1·60s 캐시)
+            body = json.dumps(scan_skills(), ensure_ascii=False).encode()
+            return self._send(200, "application/json; charset=utf-8", body)
         if path == "/peek":
             tok = self.headers.get("X-HUD-Token")
             if not self.token or not tok or not secrets.compare_digest(str(tok), str(self.token)):
@@ -1484,6 +1749,16 @@ class Handler(BaseHTTPRequestHandler):
                     body = f.read()
                 if ctype.startswith("text/html"):   # 조작 토큰 주입 (동일 페이지 한정)
                     body = body.replace(b"__HUD_TOKEN__", (self.token or "").encode())
+                    # W1-c 조용한 실패 배너 부트 가드 주입 — __HUD_TOKEN__ 치환과 별개
+                    # 앵커(</head> 직전, 실측 존재). office3d.html 본문 무접촉 원칙 준수.
+                    body = body.replace(
+                        b"</head>",
+                        b'<script src="/office-boot.js"></script>\n</head>', 1)
+                    if b"/office-boot.js" not in body:  # 주입 self-check (침묵 실패 방지)
+                        sys.stderr.write(
+                            "[hud_bridge] WARN: office-boot.js 주입 실패 — "
+                            "%s 에 </head> 앵커 부재\n" % fp)
+                        sys.stderr.flush()
                 return self._send(200, ctype, body, cache)
             except OSError:
                 return self._send(404, "text/plain", b"missing asset")
@@ -1593,6 +1868,11 @@ def main():
         "/vendor/three.module.js":
             (os.path.join(WEB_DIR, "vendor", "three.module.js"),
              "text/javascript; charset=utf-8", True),
+        # W1-c 부트 가드 — 침묵 실패 복구 안내. cache=False(no-store): 보안·복구
+        # 자산이 WKWebView 휴리스틱 캐시로 구버전 잔존하면 안 됨(HTML과 동일 근거).
+        "/office-boot.js":
+            (os.path.join(WEB_DIR, "office-boot.js"),
+             "text/javascript; charset=utf-8", False),
     }
     load_heat(world)                       # 히트 링 복원 (재시작 생존)
     world.cost_cache = {"ts": time.time(), "value": read_cost_today(TRANSCRIPTS_DB)}

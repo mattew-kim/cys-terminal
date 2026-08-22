@@ -71,3 +71,4 @@ pack-files.txt
 pack-manifest.*
 pack.tar.gz
 REVIEW-multimaster-*.md
+cysjavis-pack/state/evt_spool.jsonl

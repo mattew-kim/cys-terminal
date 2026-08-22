@@ -3,7 +3,8 @@
 
 계약(출처: _research/Paperclip_박사급_연구보고서.md §4 P0-3 · §2-7):
 - Paperclip의 진짜 런어웨이 차단 = "새 run 시작 전 라이브 재계산해 초과면 착수 거부"(사전 게이트).
-- 정액제(Claude Max)엔 달러 예산이 무력하므로 metric을 자원으로 치환:
+- 승인 패턴은 **구독제(정액) 전용·종량제 과금 금지**다. 정액 구독엔 달러 예산이라는 브레이크가
+  아예 없으므로(쓴 만큼 청구되는 축이 없다) metric을 달러가 아닌 자원으로 치환한다:
     servers  = 로컬 dev/서버 프로세스 수         (자원 거버넌스 '서버 누적' 사고 이력)
     nodes    = claude/agy/codex 노드 프로세스 수
     load     = 1분 load average / CPU 코어 수 비율
@@ -21,7 +22,15 @@
 
 테스트/자동화 주입: --servers-override/--nodes-override/--load-override (라이브 측정 대체).
 사용 예: python3 javis_resource_gate.py check --context 42 --json
-exit codes: 0 allow · 1 soft · 2 hard · (3+ 내부 오류)
+exit codes(A13 타입드 — 코드 상수와 기계 대조):
+  0  EXIT_ALLOW     허용
+  1  EXIT_SOFT      soft_warn(경고 후 진행)
+  2  EXIT_HARD      hard_block(착수 거부) — **자원 판정**에만 쓰인다
+  64 EXIT_USAGE     EX_USAGE — 미지 서브커맨드·인자 오류(측정 자체가 일어나지 않음).
+                    종전 argparse 기본 exit 2 가 EXIT_HARD 와 충돌해, 오타 하나가 '팀 기동 거부'로
+                    오독됐다(재감사 A13 치환 결함). 소비부는 이 코드를 '측정 실패'로 loud 처리한다.
+  70 EXIT_INTERNAL  EX_SOFTWARE — 게이트 내부 예외(측정 실패 ≠ soft_warn. 종전 exit 1 오분류).
+자체검증: python3 javis_resource_gate.py --self-test
 """
 import argparse
 import json
@@ -32,6 +41,13 @@ import sys
 import time
 
 EXIT_ALLOW, EXIT_SOFT, EXIT_HARD = 0, 1, 2
+# ★A13(T-0147-7 W2 · 하드 제약 8) — argparse 의 exit 2 ↔ EXIT_HARD=2 **의미 공간 충돌** 해소.
+#   종전에는 `check --unknown-flag` 같은 사용오류가 argparse 기본 동작으로 exit 2 를 냈고,
+#   소비부(javis_bootstrap ④′)는 그 2를 '자원 hard_block'으로 읽어 **아무 측정도 없이 팀 기동을
+#   거부**했다(판정과 사용오류의 융합 — RC2). 사용오류는 sysexits.h 의 EX_USAGE(64)로 분리한다.
+#   ★내부 예외(게이트가 재다가 터진 경우)도 exit 1='soft' 로 오분류됐다 — EXIT_INTERNAL 로 분리한다.
+EXIT_USAGE = 64          # EX_USAGE — 미지 서브커맨드·인자 오류(측정 자체가 일어나지 않음)
+EXIT_INTERNAL = 70       # EX_SOFTWARE — 게이트 내부 예외(측정 실패 ≠ soft_warn)
 
 SERVER_PATTERNS = [
     r"bun .*server", r"node .*server", r"vite(\s|$)", r"next dev", r"uvicorn",
@@ -141,6 +157,60 @@ def measure(a):
             "active_depts": active_depts, "nodes_hard_effective": nodes_hard_effective}
 
 
+# ── ★opt-in rate 축(soft-only) — 구독제(정액) 5h rate 사용률 사전 경고 ──
+def _rate_enabled(a):
+    """rate 축은 opt-in — --rate-check 플래그 또는 env CYS_GATE_RATE=1일 때만 발화."""
+    return bool(getattr(a, "rate_check", False)) or os.environ.get("CYS_GATE_RATE") == "1"
+
+
+def _rate_accounts(a):
+    """rate 원천 — --rate-override(테스트 주입) 우선, 없으면 `cys usage-accounts --json`.
+    cys 부재·타임아웃·파싱 실패는 None(축 자체 스킵) — best-effort, 조직 기동 무차단."""
+    if getattr(a, "rate_override", None) is not None:
+        try:
+            data = json.loads(a.rate_override)
+        except ValueError:
+            return None
+    else:
+        try:
+            out = subprocess.run(["cys", "usage-accounts", "--json"],
+                                 capture_output=True, text=True, timeout=3).stdout
+            data = json.loads(out)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return None
+    if isinstance(data, dict):      # {"accounts":[...]} 또는 바로 [...] 둘 다 수용
+        data = data.get("accounts")
+    return data if isinstance(data, list) else None
+
+
+def _rate_checks(a):
+    """rate 5h 사용률 soft 경고 축(soft-only). 발화 조건: rate label=="5h"·신선(stale_secs<600)·
+    used_pct>=rate_soft. hard 없음 — 게이트는 master 부트 플로우가 호출하므로 rate로 조직 기동을
+    막지 않는다. 반환: soft check dict 리스트(빈 리스트=무발화). (테스트 주입=--rate-override)"""
+    accounts = _rate_accounts(a)
+    if not accounts:
+        return []
+    out = []
+    for acct in accounts:
+        if not isinstance(acct, dict):
+            continue
+        label = acct.get("label", "?")
+        for entry in acct.get("rate", []) or []:
+            if not isinstance(entry, dict) or entry.get("label") != "5h":
+                continue
+            stale = entry.get("stale_secs")
+            if stale is None:            # rate 엔트리에 없으면 계정 레벨로 폴백
+                stale = acct.get("stale_secs")
+            if stale is None or stale >= 600:   # null·비신선(오래된 측정)은 스킵
+                continue
+            used = entry.get("used_pct")
+            if used is None or used < a.rate_soft:
+                continue
+            out.append({"metric": "rate_5h(%s)" % label, "value": used,
+                        "soft": a.rate_soft, "hard": None, "level": "soft"})
+    return out
+
+
 def evaluate(m, a):
     checks = []
 
@@ -156,6 +226,11 @@ def evaluate(m, a):
     add("load_ratio", m["load_ratio"], a.load_soft_ratio, a.load_hard_ratio)
     add("context_pct", m["context_pct"], a.context_soft, a.context_hard)
 
+    # ★opt-in rate 축(soft-only) — --rate-check 또는 CYS_GATE_RATE=1일 때만. hard 없음:
+    # 게이트는 master 부트 플로우가 호출하므로 rate로 조직 기동을 막지 않는다(soft만 반영).
+    if _rate_enabled(a):
+        checks.extend(_rate_checks(a))
+
     # 측정 실패는 최소 soft로 격상(조용한 allow 금지 · P-ORCH-1) — 실제 hard 트립이 있으면 hard가 우선.
     worst = "soft" if m.get("measure_errors") else "ok"
     for c in checks:
@@ -170,6 +245,13 @@ def evaluate(m, a):
 def cmd_check(a):
     m = measure(a)
     worst, checks = evaluate(m, a)
+    # ★T1/B1(Phase 1 · DESIGN-DECISIONS §2-5 · 조건 10): --require-context 지정 시 context
+    #   미제공(자기보고 부재)을 soft(exit 1)로 격상 — '미측정=조용한 allow' 상속을 소비부
+    #   (javis_completion_guard 등 verify 실행 경로)가 결정론으로 감지하게 한다.
+    #   기본 동작 불변(플래그 없으면 종전과 동일 — 기존 부트 플로우 회귀 0). 실제 자원
+    #   soft/hard 트립이 있으면 그것이 그대로 우선한다(여기서는 ok→soft 승격만).
+    if getattr(a, "require_context", False) and m["context_pct"] is None and worst == "ok":
+        worst = "soft"
     verdict = {"ok": "allow", "soft": "soft_warn", "hard": "hard_block"}[worst]
     trips = [c for c in checks if c["level"] != "ok"]
     warnings = []
@@ -356,8 +438,32 @@ def cmd_enforce(a):
     return EXIT_ALLOW
 
 
+class _UsageExit(Exception):
+    """argparse 의 SystemExit(2) 를 가로채 EX_USAGE(64) 로 remap 하기 위한 내부 신호."""
+
+
+class _GateArgumentParser(argparse.ArgumentParser):
+    """★A13: argparse 의 사용오류 종료를 exit 2(=EXIT_HARD) 로 흘려보내지 않는다.
+
+    argparse 는 error()/exit(2) 로 SystemExit(2) 를 던진다 — 그 2가 이 도구의 '자원 hard_block'
+    코드와 같아서, 소비부가 **오타 하나를 팀 기동 거부로 오독**했다. usage 메시지는 그대로
+    stderr 에 내되(진단 보존), 종료 코드만 EX_USAGE(64)로 분리한다."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("%s: error: %s\n" % (self.prog, message))
+        raise _UsageExit(message)
+
+    def exit(self, status=0, message=None):
+        if message:
+            sys.stderr.write(message)
+        if status == 0:
+            raise SystemExit(0)          # --help 등 정상 종료는 보존
+        raise _UsageExit("argparse exit %s" % status)
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description="자원 사전 게이트 — 착수 전 차단 (P0-3)")
+    p = _GateArgumentParser(description="자원 사전 게이트 — 착수 전 차단 (P0-3)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("check")
@@ -374,6 +480,14 @@ def main(argv=None):
     c.add_argument("--servers-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--nodes-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--load-override", type=float, default=None, help="테스트 주입")
+    c.add_argument("--rate-check", action="store_true",
+                   help="opt-in: 5h rate 사용률 soft 경고 축 추가(env CYS_GATE_RATE=1과 동등)")
+    c.add_argument("--rate-soft", type=float, default=80.0, help="rate 5h used_pct soft 임계")
+    c.add_argument("--rate-override", default=None,
+                   help="테스트 주입 — usage-accounts JSON(accounts 배열) 직접 주입")
+    c.add_argument("--require-context", dest="require_context", action="store_true",
+                   help="Phase 1 §2-5: context 미제공 시 context_unmeasured 를 soft(exit 1)로 "
+                        "격상 — verify 실행 경로(completion-guard) 전용. 기본 동작 불변")
     c.set_defaults(fn=cmd_check)
 
     c = sub.add_parser("classify")
@@ -390,9 +504,118 @@ def main(argv=None):
     c.add_argument("--pids", type=int, nargs="*", default=None, help="테스트 주입(임계 우회)")
     c.set_defaults(fn=cmd_enforce)
 
-    a = p.parse_args(argv)
-    return a.fn(a)
+    try:
+        a = p.parse_args(argv)
+    except _UsageExit:
+        return EXIT_USAGE
+    # ★내부 예외를 exit 1('soft_warn')로 흘리지 않는다 — '측정 실패'와 '자원 경고'는 다른 사실이다.
+    #   traceback 은 stderr 로 남기고(진단 보존) 계약 채널(stdout)은 오염시키지 않는다.
+    try:
+        return a.fn(a)
+    except SystemExit:
+        raise
+    except Exception as e:                      # noqa: BLE001 — 최상위 경계에서 타입 분리가 목적
+        import traceback
+        traceback.print_exc()
+        sys.stderr.write("[resource-gate] 내부 예외로 측정 실패(exit %d=EX_SOFTWARE): %s\n"
+                         % (EXIT_INTERNAL, e))
+        return EXIT_INTERNAL
+
+
+def self_test():
+    """A13 타입드 exit 회귀 배터리 — 측정 없이 결정론(부작용 0)."""
+    fails = []
+
+    def chk(cond, msg):
+        if not cond:
+            fails.append(msg)
+
+    import io
+    import contextlib
+    # ① 미지 서브커맨드 → EX_USAGE(64), EXIT_HARD(2) 와 분리
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = main(["definitely-not-a-subcommand"])
+    chk(rc == EXIT_USAGE, "미지 서브커맨드가 EX_USAGE(64) 아님: rc=%r" % rc)
+    chk(rc != EXIT_HARD, "사용오류가 hard_block(2)로 오독됨 — argparse↔EXIT_HARD 충돌 잔존")
+    # ② 미지 플래그도 동일
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = main(["check", "--no-such-flag"])
+    chk(rc == EXIT_USAGE, "미지 플래그가 EX_USAGE(64) 아님: rc=%r" % rc)
+    # ③ 인자 없음(subparser required) → EX_USAGE
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = main([])
+    chk(rc == EXIT_USAGE, "서브커맨드 부재가 EX_USAGE(64) 아님: rc=%r" % rc)
+    # ④ 정상 판정 경로는 무회귀(override 주입으로 측정 대체 — 라이브 ps 무의존)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--servers-override", "0", "--nodes-override", "0",
+                   "--load-override", "0.0"])
+    chk(rc == EXIT_ALLOW, "정상 allow 경로 회귀: rc=%r" % rc)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--servers-override", "99", "--nodes-override", "0",
+                   "--load-override", "0.0"])
+    chk(rc == EXIT_HARD, "servers hard 경로 회귀: rc=%r" % rc)
+    # ⑤ 내부 예외 → EX_SOFTWARE(70), 'soft'(1) 오분류 아님
+    import types
+    ns = types.SimpleNamespace(fn=lambda _a: (_ for _ in ()).throw(RuntimeError("boom")))
+    saved = _GateArgumentParser.parse_args
+    try:
+        _GateArgumentParser.parse_args = lambda self, argv=None: ns
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["check"])
+    finally:
+        _GateArgumentParser.parse_args = saved
+    chk(rc == EXIT_INTERNAL, "내부 예외가 EX_SOFTWARE(70) 아님: rc=%r" % rc)
+    chk(rc != EXIT_SOFT, "내부 예외가 soft_warn(1)로 오분류 — 측정 실패↔자원 경고 융합 잔존")
+    # ⑥ 계약 채널: --json 의 stdout 은 순수 JSON(진단 혼입 0)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+        main(["check", "--json", "--servers-override", "0", "--nodes-override", "0",
+              "--load-override", "0.0"])
+    try:
+        json.loads(buf.getvalue().strip())
+    except ValueError as e:
+        fails.append("--json stdout 이 순수 JSON 아님: %s" % e)
+    # ⑦ ★B1(§2-5): --require-context + context 미제공 → soft(exit 1)·trips 는 비어 있음
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(["check", "--json", "--require-context", "--servers-override", "0",
+                   "--nodes-override", "0", "--load-override", "0.0"])
+    chk(rc == EXIT_SOFT, "--require-context 미제공이 soft(1) 아님: rc=%r" % rc)
+    try:
+        doc = json.loads(buf.getvalue().strip())
+        chk(doc.get("trips") == [], "--require-context 승격이 trips 를 오염: %r" % doc.get("trips"))
+        chk("context_unmeasured" in (doc.get("warnings") or []),
+            "--require-context 미제공에 context_unmeasured 경고 부재")
+    except ValueError as e:
+        fails.append("--require-context --json 파싱 실패: %s" % e)
+    # ⑧ --require-context + context 제공 → 종전 판정 그대로(42=allow · 61=hard)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--require-context", "--context", "42", "--servers-override", "0",
+                   "--nodes-override", "0", "--load-override", "0.0"])
+    chk(rc == EXIT_ALLOW, "--require-context+context 42 가 allow 아님: rc=%r" % rc)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--require-context", "--context", "61", "--servers-override", "0",
+                   "--nodes-override", "0", "--load-override", "0.0"])
+    chk(rc == EXIT_HARD, "--require-context+context 61 이 hard(2) 아님: rc=%r" % rc)
+    # ⑨ 플래그 없는 기존 호출 = 기본 동작 불변(context 미제공 = allow · 회귀 0)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--servers-override", "0", "--nodes-override", "0",
+                   "--load-override", "0.0"])
+    chk(rc == EXIT_ALLOW, "플래그 없는 context 미제공이 allow 아님(기본 동작 회귀): rc=%r" % rc)
+
+    if fails:
+        print("javis_resource_gate self-test FAIL:")
+        for f in fails:
+            print("  ✗ " + f)
+        return 1
+    print("javis_resource_gate self-test OK — A13 타입드 exit 9종"
+          "(EX_USAGE 3·정상 2·EX_SOFTWARE 2·계약 채널 1·충돌 분리 1)"
+          " + B1 --require-context 5종(미제공 soft·trips 비오염·context 제공 allow/hard·"
+          "무플래그 기본 동작 불변)")
+    return 0
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:
+        sys.exit(self_test())
     sys.exit(main())

@@ -8,7 +8,14 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
 
 서브커맨드:
   check                         4종 의무 노드(cso·worker·reviewer-gemini·reviewer-codex)
-                                생존을 cys status로 판정. exit 0=4종 생존, 1=부재 존재.
+                                생존을 cys status로 판정.
+                                exit 0=의무 역할 전원 생존 / 1=**노드 미기동**(실측 판정 —
+                                status는 받았고 그중 부재 역할이 있다) /
+                                2=**판정 불가**(cys 미설치·데몬 소실·status --json 비0/파손 —
+                                cys_status()가 None). ★2와 1은 다른 사실이다: 2는 노드에 대해
+                                아무것도 말하지 않는다(데몬 소실을 '노드 미기동'으로 오귀속하면
+                                처방이 뒤집힌다 — 2는 `cys ping`·데몬 기동, 1은 `cys boot`).
+                                소비자(javis_bootstrap ⑤ 등)는 두 갈래를 분기해야 한다.
   review-prompt --task T --scope S [--reviewer gemini|codex] [--round N] [--success X]
                                 REVIEWER_DIRECTIVE §2 제약 + 형식 + 회신 채널을 항상 포함한
                                 리뷰 의뢰 프롬프트를 출력(제약 누락 구조 차단). --success는
@@ -34,20 +41,26 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
                                 pipeline·cys 워커 순차 위임으로 실행(스킬 안내).
                                 exit: 0=출력 / 2=phases 비었거나 역할명 위반.
   round-init   --task T                       라운드 장부 생성
-  round-log    --task T --round N --evaluator E [--score X --verdict V | --from-cmd CMD | --verdict-json J]
+  round-log    --task T --round N --evaluator E [--verdict V | --from-cmd CMD | --verdict-json J]
                                 라운드 기록 append. --from-cmd는 기계검증 명령을 직접 실행해
                                 exit code로 verdict 자동 기록(machine 평가자 규약 — 전사 금지).
                                 exit: 0=기록(검증 통과 포함) / 1=기록됨·기계검증 실패
                                 (기록 성공≠검증 통과 — 판정의 단일 진실은 gate-status).
-  round-status --task T                       현재 라운드·10R 도달·최근 점수 결정론 판정
+  round-status --task T                       현재 라운드·10R 도달·최근 기록값 결정론 판정
   gate-status  --task T [--round N]           자율주행(앵커6 축1) 게이트 4자 수렴 결정론 판정:
                                 해당 라운드에 gemini·codex·master·machine 4평가자의 승인
                                 (PASS/수렴/approve/ok/green 접두) 기록이 전부 있어야 CONVERGED.
-                                exit 0=수렴(다음 단계 자동 착수 가) / 1=미수렴(사유 출력).
+                                exit 0=수렴+임무 있음(다음 단계 자동 착수 가) / 1=미수렴 /
+                                2=정직한 SKIP / **4=수렴했으나 오너 임무 미지정(자동 착수 금지)**.
   next-action                   자율주행(앵커6 축3) 다음 액션 결정론 추출: pack/round/
                                 SESSION_STATE.md '## 다음 액션' 섹션의 첫 미완 항목을 출력.
-                                exit 0=항목 있음 / 1=큐 비음(전 작업 완료 — 정지·오너 보고)
-                                / 2=SESSION_STATE 부재(신규 시작 — 오너 지시 대기).
+                                ★임무 게이트(T1 2026-08-01): 큐에 항목이 있어도 **이 세션에
+                                오너 임무 지정이 없으면 착수하지 않는다** — 큐는 master 자신이
+                                쓴 파일이라 자기인가가 되기 때문이다(판정=javis_mission.gate).
+                                exit 0=항목 있음+임무 지정됨(자율 착수 가)
+                                / 1=큐 비음(전 작업 완료 — 정지·오너 보고)
+                                / 2=SESSION_STATE 부재(신규 시작 — 오너 지시 대기)
+                                / 3=항목 있음·임무 미지정 → 보고하고 멈춘다(자율 착수 금지).
 
 의존성: 파이썬 표준 라이브러리 + PATH의 cys(check만 필요).
 """
@@ -59,15 +72,43 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+
+# ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
+#   ._pth 는 표준 경로 계산을 우회해 **스크립트 폴더를 sys.path 에 넣지 않는다**
+#   (2026-07-29 Windows 0.14.4 실측: `ModuleNotFoundError: No module named 'javis_scrub'`).
+#   unix/mac 은 스크립트 폴더가 이미 sys.path[0] 이라 이 블록은 무동작(멱등).
+#   ★append 인 이유는 MAJ#1 과 동일 — **발견이 목적이지 기존 항목의 precedence 를 강등하지 않는다**
+#   (bin/ 을 stdlib 앞에 놓지 않아 미래의 이름충돌 shadowing 을 원천 차단).
+#   선례(append 형태): javis_report.py:33-34.
+#   (hooks/inject_gate.py:22 는 insert(0) + CYS_PACK_DIR 기반 경로 — 형태가 다르므로 선례 아님)
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
+# ★로케일 비의존 I/O(W-A4 · 선례 javis_bootstrap.py R3/D-IMPL-3 · javis_detect.py G9 · javis_mission.py):
+#   ANSI 코드페이지가 UTF-8 이 아닌 Windows(한국어 cp949·서구 cp1252·일본 cp932)에서 stdout 이
+#   파이프로 캡처되면(부트 체인 ⑤ 가 check 출력을 캡처하는 경로가 정확히 그것) `✓`/`✗`/`⚠`/`↳`·`—`
+#   또는 첫 한글 출력에서 UnicodeEncodeError 로 즉사한다 — 실측: PYTHONIOENCODING=cp949 에서
+#   `--note-team-roster` 가 U+2014(—) position 66 크래시. 팀이 실제로 5개 다 떠 있어도 ⑤ 의
+#   24회 재시도가 전부 같은 크래시로 죽어 부트 exit 6·완료 마커 미기록(허위 실패)이 됐다.
+#   출력 인코딩만 고정한다 — 판정 로직·exit code 무접촉. errors="replace" 라 최악에도 '깨진
+#   글자'일 뿐 크래시가 아니다. try/except 는 reconfigure 부재(구형 파이썬·비 TextIOWrapper
+#   스트림) 허용 — 형태는 선례와 자구 동일(사본 드리프트 방지).
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # 4차 앵커4-1: 프로젝트 상주 의무 노드(grok은 선택). 이것은 *표준(Tier-2 이상) 기본 로스터*다.
 # ★check 가 실제로 검증하는 것은 effective_required_roles()(=감지 폴백 적용) — REQUIRED_ROLES 는
 # 계약·문서용 표준 상수로 보존한다. agy/codex 미감지 시 리뷰어 슬롯은 Claude 대체로 치환된다.
 REQUIRED_ROLES = ["cso", "worker", "reviewer-gemini", "reviewer-codex"]
 OPTIONAL_ROLES = ["reviewer-grok"]
-MAX_ROUNDS = 10  # 앵커4 5-8: 맥킨지급 도달 또는 10R 완료 시 멈춤
+MAX_ROUNDS = 10  # 마스터 헌장 제9조: 잠근 합격 기준의 미달 항목 0 또는 10R 상한 도달 시 멈춘다
 
-# ★리뷰어 슬롯 + 무구독 폴백(오너 2026-06-14): agy(reviewer-gemini)·codex(reviewer-codex)는
+# ★리뷰어 슬롯 + 무구독 폴백(2026-06-14): agy(reviewer-gemini)·codex(reviewer-codex)는
 # '기본 전제'일 뿐 절대 전제가 아니다 — 사용자가 다른 임무를 줄 수도, 구독·CLI가 없을 수도 있다.
 # master 부트 후 리뷰어를 '호출하는 단계'에서 감지하지 못하면 멈추지 말고 곧바로 Claude 대체
 # 리뷰어로 폴백한다. 감지는 LLM 자연어 재추론이 아니라 아래 결정론 함수만이 사실이다(§12).
@@ -76,6 +117,94 @@ REVIEWER_SLOTS = [
     ("reviewer-gemini", "gemini", "reviewer-claude-1", "claude"),
     ("reviewer-codex",  "codex",  "reviewer-claude-2", "claude"),
 ]
+
+# ─────────────────── B1: PLAN 테이블 정책 열 (의무/선택을 편성과 같은 소스에) ───────────────────
+# ★재감사 B1: 의무 리뷰어가 지속 고장이면 종전 체인은 **영구 데드엔드**였다(자동 회복 0) —
+#   ④ cys boot 가 비0 을 내면 javis_bootstrap 이 exit 4 로 죽고, 리뷰어 1종 고장이 팀 전체
+#   기동 실패로 번졌다. 의무/선택 판정이 **편성 테이블 밖**(호출부 산문·주석)에 있었기 때문이다.
+#   정책을 편성과 같은 행에 둔다 — 소비자는 산문을 읽지 않고 이 열을 읽는다.
+#     Fatal   = 이 역할 기동 실패 = 부트 실패(exit 4). cso·worker(조직의 최소 실행 단위).
+#     Degrade = 경고로 강등하고 ④-b·⑤ 를 계속한다. 리뷰어(대체 폴백·익명 peer-review 로 보완 가능).
+#   ★{B1,B2} 동시 착륙 필수(하드 제약 3): B1 단독이면 데드엔드가 ④→⑤ 로 이동만 한다
+#   (④ 는 통과하는데 ⑤ check 가 네이티브 리뷰어를 계속 요구해 영구 적색).
+FAIL_FATAL = "Fatal"
+FAIL_DEGRADE = "Degrade"
+BOOT_PLAN = [
+    ("cso", "claude", FAIL_FATAL),
+    ("worker", "claude", FAIL_FATAL),
+    ("reviewer-gemini", "gemini", FAIL_DEGRADE),
+    ("reviewer-codex", "codex", FAIL_DEGRADE),
+    ("reviewer-grok", "grok", FAIL_DEGRADE),
+]
+
+
+def plan_policy(role):
+    """role → "Fatal"|"Degrade". PLAN 미등재 role 은 Degrade(보수 — 미지 역할이 부트를 죽이지 않게)."""
+    for r, _agent, policy in BOOT_PLAN:
+        if r == role:
+            return policy
+    return FAIL_DEGRADE
+
+
+def plan_mandatory_roles():
+    """Fatal 정책 역할 목록 — `cys boot --json` 의 `mandatory:true` 집합과 기계 대조된다(H-EXIT-4)."""
+    return [r for r, _a, p in BOOT_PLAN if p == FAIL_FATAL]
+
+
+# ─────────────────── 공유 술어 ③: slot_satisfied (B2 — 실충전자 라벨링) ───────────────────
+def _slot_for(required):
+    """required 리뷰어 역할이 속한 REVIEWER_SLOTS 행 반환(네이티브·대체 어느 이름으로도 조회)."""
+    for nrole, nagent, srole, sagent in REVIEWER_SLOTS:
+        if required in (nrole, srole):
+            return nrole, nagent, srole, sagent
+    return None
+
+
+def slot_satisfied(required, live_roles):
+    """★공유 술어 ③ — 의무 역할 `required` 가 라이브 좌석으로 충족되는가 + **누가 실제로 채웠는가**.
+
+    반환 (satisfied: bool, filler: str|None, native: bool|None, why: str).
+
+    ★B2 가 고치는 것: boot-reviewers 의 **2차 폴백**(네이티브 CLI 는 설치됐는데 각성 실패 →
+      reviewer-claude-N 로 전환)이 발생하면 좌석은 대체 역할명으로 서고, ⑤check 는 여전히
+      네이티브 역할명을 요구해 **영구 적색 + 재선언 불회복**이 됐다. 슬롯은 '네이티브 ∨ 대체'
+      로 충족되며, 보고는 **실충전자를 라벨링**한다(정직한 강등 — 은닉 성공 금지).
+    ★비-리뷰어(cso·worker)는 슬롯 개념이 없다 — 정확일치+worker 접두(role_matches_requirement)만.
+    ★전제(하드 제약 7): G2(session-start role case) 착지 완료. 미착지 상태로 대체 좌석을 GREEN
+      인정하면 '지침 없는 리뷰어 GREEN'(B6 동형 허위 성공)이 된다 — W1a 에서 이미 착지했다.
+    """
+    bn = _boot_node()
+    match = (bn.role_matches_requirement if bn is not None
+             else (lambda req, cand: req == cand or (req == "worker" and cand.startswith("worker"))))
+    # ★결정론(자가치유 보호): live_roles 는 **집합**이라 순회 순서가 비결정적이다. worker 처럼
+    #   복수 좌석이 가능한 요건에서 임의의 후보를 집으면, 죽은 worker-3 를 골라 '미기동' 오판을
+    #   내고 그 오판이 결손>0 → 불필요한 스폰·재선언 churn 으로 번진다. 정렬로 못박고, 정확일치
+    #   후보를 접두 후보보다 앞세운다(요건 이름 그대로의 좌석이 1순위 대표).
+    #   ★등급 기반 최선 선택은 호출부(check_verdicts)가 한다 — 이 함수는 순수 이름공간 판정이다.
+    natives = sorted(c for c in live_roles if match(required, c))
+    if natives:
+        cand = required if required in natives else natives[0]
+        return True, cand, True, "네이티브 좌석 %s%s" % (
+            cand, "" if len(natives) == 1 else " (동족 %d좌석 중 대표)" % len(natives))
+    slot = _slot_for(required)
+    if slot is None:
+        return False, None, None, "부재(슬롯 없는 역할 — 정확일치 요건)"
+    nrole, nagent, srole, sagent = slot
+    for cand in live_roles:
+        if cand == srole:
+            return (True, srole, False,
+                    "대체 좌석 %s(%s)가 슬롯 충전 — 네이티브 %s(%s) 부재"
+                    % (srole, sagent, nrole, nagent))
+    return False, None, None, "부재(네이티브 %s·대체 %s 모두 없음)" % (nrole, srole)
+
+
+def _boot_node():
+    """공유 술어 모듈 — 소비 불가 시 None(호출부가 명시 폴백. 조용한 접힘 금지)."""
+    try:
+        import javis_boot_node as _bn
+        return _bn
+    except Exception:
+        return None
 
 
 def _agents_json():
@@ -95,11 +224,57 @@ def reviewer_launch_binary(agent, agents=None):
     return os.path.expanduser(cmd.split()[0])
 
 
+# 단일 오라클 캐시 — 프로세스 생애 1회 spawn (asked=질문했는가 / agents=결과 or None).
+_CYS_AGENT_DETECT = {"asked": False, "agents": None}
+
+
+def cys_agent_detect(timeout=10):
+    """★(W4 · 재감사 §3 CS-1③ · B12) `cys agent-detect --json` = 어댑터 설치 감지의 **단일 오라클**.
+    Rust 쪽이 한 곳에서 extract_bin(env-prefix 건너뛰기) + 틸드확장 + 실행권 + (Windows 후보
+    순회)를 판정하므로, python 이 같은 규칙을 재발명하다 어긋나던 경로(구: Rust=exists() /
+    python=os.access X_OK)를 없앤다.
+    반환: {agent: {"installed": bool, ...}} · None = 판정 불가(cys 부재·구버전 cys 로 서브커맨드
+    미지원·실행/파싱 실패) → **호출부가 자체 감지로 폴백**한다(감지가 죽어서 부트가 멈추면 안 된다).
+    프로세스당 1회만 spawn 하고 결과를 캐시한다(로스터가 agent 마다 물어도 subprocess 1회)."""
+    if _CYS_AGENT_DETECT["asked"]:
+        return _CYS_AGENT_DETECT["agents"]
+    _CYS_AGENT_DETECT["asked"] = True
+    got = None
+    cys = shutil.which("cys")
+    if cys:
+        try:
+            r = subprocess.run([cys, "agent-detect", "--json"],
+                               capture_output=True, timeout=timeout)
+            if r.returncode == 0:
+                d = json.loads((r.stdout or b"").decode("utf-8", "replace"))
+                a = d.get("agents")
+                if isinstance(a, dict):
+                    got = a
+        except Exception:
+            got = None
+    _CYS_AGENT_DETECT["agents"] = got
+    return got
+
+
 def detect_reviewer(agent, agents=None):
     """★결정론 1차 감지(오너 '가장 중요한 전제') — 그 리뷰어 CLI 가 *호출 가능*한가.
-    바이너리가 절대경로로 실재·실행가능하거나 PATH 에서 해석되면 available.
+    ★1순위 = cys_agent_detect() (Rust 단일 오라클 · W4 CS-1③). 그 판정이 SOT 다.
+    ★폴백(오라클 부재·실패·해당 agent 미수록) = 아래 자체 감지: 바이너리가 절대경로로 실재·
+    실행가능(os.access X_OK)하거나 PATH(shutil.which)에서 해석되면 available. 폴백은 제거하지
+    않는다 — 구버전 cys·cys 미설치 머신에서도 감지가 답을 내야 한다(하드 삭제 금지).
+    ★오라클은 **실디스크 어댑터 정의에 대한 판정**이다. 그래서 주입된 `agents` 가 디스크 본과
+    다르면(=합성 fixture 를 넣은 밀폐 self-test) 쓰지 않는다 — 주입을 무시하고 실환경을 보면
+    테스트 밀폐가 깨진다. reviewer_roster 처럼 디스크에서 해소한 dict 는 같으므로 소비된다
+    (로스터가 오라클을 못 쓰면 이 단일화가 무의미해진다).
     인증·구독 유무는 여기서 판정하지 않는다(미인증은 부트 시 set-status ack 부재로
     boot-reviewers 가 2차 폴백한다). claude 는 시스템 전제. 반환: (available, reason)."""
+    if agents is None or agents == _agents_json():
+        oracle = cys_agent_detect()
+        if isinstance(oracle, dict):
+            ent = oracle.get(agent)
+            if isinstance(ent, dict) and isinstance(ent.get("installed"), bool):
+                return ent["installed"], "cys agent-detect: %s" % (
+                    ent.get("reason") or ("installed" if ent["installed"] else "missing"))
     binp = reviewer_launch_binary(agent, agents)
     if not binp:
         return False, "agents.json 에 %s.cmd 없음" % agent
@@ -132,12 +307,65 @@ def effective_required_roles(detect=None, agents=None):
     return ["cso", "worker"] + [e["role"] for e in reviewer_roster(detect, agents)]
 
 
+# ─────────────────── B18: 팀 구성 안내 문구의 단일 파생 소스 (H-DOC-2) ───────────────────
+def team_roster_note(required=None):
+    """훅 note·문서가 인용할 '완료 = 무엇이 떠야 하나' 한 줄. **하드코딩 금지**.
+
+    ★B18(재감사 P3 · RC6): 훅 note 가 `master·cso·worker·reviewer×2 (5노드)` 를 **리터럴**로
+      박아 놓고, 판정 술어(`REQUIRED_ROLES` / `effective_required_roles`)는 그와 무관하게
+      진화했다 — 편성이 바뀌면 문서만 거짓이 되는 사본 드리프트(P3-A-120S 의 문서면과 동형).
+      숫자·역할명을 **여기서 파생**해 소비처는 인용만 한다.
+    ★금지 방향 ②(하드 제약 6): `REQUIRED_ROLES` 에 master 를 넣어 이 숫자를 맞추는 것은
+      **금지**다 — check 의 required 집합이 master 를 요구하면 레거시 master(자기 좌석을
+      스스로 세지 못하는 구 데몬 조합)에서 부트 전체가 사망한다. master 는 '선언한 자기 자신'
+      이므로 required 밖에 있는 것이 정상이고, 안내 문구에서만 `+1` 로 합산한다.
+    ★감지 미호출: `REQUIRED_ROLES`(표준 상수)만 읽는다 — 훅 발화 경로의 안내 1줄을 위해
+      `cys agent-detect` 서브프로세스를 띄우지 않는다(발화 지연 0). 대체 슬롯 치환 가능성은
+      문구로 고지한다(로스터 실체는 ⑤check 가 판정).
+    """
+    roles = ["master"] + list(REQUIRED_ROLES if required is None else required)
+    return ("%s (필수 역할 전원+master — 총 %d노드 · 리뷰어는 미감지 시 Claude 대체 슬롯으로 치환)"
+            % ("·".join(roles), len(roles)))
+
+
+# ★팩 경로 env 키의 우선순위 목록(W14 S19). Rust 정본 `src/pack.rs::PACK_DIR_ENV_KEYS`와
+# **같은 목록·같은 순서**여야 한다 — `tests/test_todo_shared_constants.py`가 기계 대조한다.
+# 종전에는 이 목록이 3종으로 갈려 있었고, `cys todo-path`가 `AITERM_JARVIS_DIR`를 인식하지
+# 못해 레거시 env 환경에서 **생성 위치와 스캔 위치가 갈려 파일이 보고기에 영영 보이지 않았다**.
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
 def pack_dir():
-    for key in ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_JARVIS_DIR"):
+    """팩 경로. 키 목록·순서는 `PACK_DIR_ENV_KEYS`(Rust `src/pack.rs`와 기계 대조)."""
+    for key in PACK_DIR_ENV_KEYS:
         v = os.environ.get(key, "")
         if v:
             return v
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
+
+
+def _cys_status_timeout_s():
+    """cys_status 서브프로세스 상한 — javis_budget leaf `CYS_STATUS_TIMEOUT_S` 파생(W-A4).
+
+    종전 하드코딩 10 은 예산 위반이었다: LEAF_FLOORS 의 냉시작 실측 하한이 12 고, 그 주석이
+    이미 'orchestra.cys_status' 를 소비자로 명기하는데 실물만 10 으로 더 작았다(장부↔실물
+    사본 드리프트). 데몬 냉시작·프로세스 표 refresh 로 status 가 10~12s 걸리는 창에서 정상
+    데몬이 None(판정 불가)으로 접혀 check exit 2 오귀속을 만든다.
+    ★짝 사본 배선 완료(W-B1 ④ · W-A4b 후속 · 2026-08-21): javis_boot_node.cys_status 도
+    이제 같은 leaf 를 소비한다 — `timeout=budget("CYS_STATUS_TIMEOUT_S", 12)` (그 파일의
+    budget() 헬퍼 경유 · import 실패 시 leaf 하한 12 명시 폴백). 두 사본이 '값이 우연히
+    같은' 상태에서 '**같은 leaf 를 보는**' 상태로 승격됐다 — leaf 가 12 에서 움직이면
+    이제 양쪽이 함께 움직인다(사본 드리프트 소멸 · tests/test_seat_latch_negation.py 가
+    배선 사실을 기계 대조). cys_list_rows 등 나머지 cys RPC 하드코딩은 W-B1 범위 밖이다
+    (티켓이 지정한 leaf 는 status 하나 — CYS_LIST_TIMEOUT_S 는 leaf 15 로 현행 12 와 값이
+    달라, 배선이 곧 동작 변경이라 별도 티켓 소유).
+    import 실패(부서 팩 결손·팩 스큐)는 leaf 하한 12 명시 폴백 — 예산 모듈 부재가 새 크래시
+    지점이 되면 안 된다(선례: 같은 파일 _boot_node_outer_timeout · javis_bootstrap._budget_leaf).
+    """
+    try:
+        import javis_budget as _b
+        return float(_b.leaf("CYS_STATUS_TIMEOUT_S"))
+    except Exception:
+        return 12.0
 
 
 def cys_status():
@@ -145,7 +373,8 @@ def cys_status():
     if not cys:
         return None
     try:
-        r = subprocess.run([cys, "status", "--json"], capture_output=True, timeout=10)
+        r = subprocess.run([cys, "status", "--json"], capture_output=True,
+                           timeout=_cys_status_timeout_s())
         if r.returncode != 0:
             return None
         return json.loads(r.stdout.decode("utf-8", "replace"))
@@ -190,14 +419,142 @@ def _quiet_alive_roles(status, roles):
     reclaim 이 같은 상태를 반대로 해석하던 중복 로직 제거). status 를 surface_ref 에 결박해
     litter/exited row·과거이력 오인을 차단한다."""
     out = {}
-    try:
-        import javis_boot_node as _bn
-    except Exception:
+    bn = _boot_node()
+    if bn is None:
         return out
     for role in roles:
-        if _bn.quiet_but_alive(status, role):
+        if bn.quiet_but_alive(status, role):
             out[role] = True
     return out
+
+
+def live_role_names(status):
+    """status → 라이브(미exited) role 이름 집합. slot_satisfied·결손 판정의 공통 입력."""
+    return {s.get("role") for s in status.get("surfaces", [])
+            if s.get("role") and not s.get("exited")}
+
+
+def check_verdicts(status):
+    """★check 판정의 순수 함수 코어 — (verdicts, roster). 데몬 왕복 0(status 주입).
+
+    verdicts: required role → {"satisfied","grade","filler","native","why"}
+      grade ∈ awake_confirmed | alive_presumed | absent | unknown  (javis_boot_node.node_liveness)
+
+    ★B6 — 1차 통과 기준은 **fresh set-status ack(또는 awakened_at 래치)** 이고, `agent_alive`
+      단독은 '생존추정'으로 **강등 라벨링**된다. 강등은 라벨이지 실패가 아니다(exit 는 불변):
+      실패로 승격하면 래치 배포 이전 기계의 건강한 팀이 전부 적색이 되는 역방향 회귀다.
+    ★B2 — 슬롯 충족은 `slot_satisfied`(네이티브 ∨ 대체) 단일 술어를 소비하고 **실충전자**를 남긴다.
+    ★결손 판정(javis_bootstrap)·wakeup zombie 가드·reclaim 이 같은 함수를 소비한다(A1 클래스).
+    """
+    bn = _boot_node()
+    roster = reviewer_roster()
+    required = ["cso", "worker"] + [e["role"] for e in roster]
+    live = live_role_names(status)
+    # 등급 우선순위(높을수록 건강) — 동족 좌석이 여러 개일 때 **가장 건강한 좌석**이 요건을 대표한다.
+    # ★왜: worker 가 3개 있고 그중 하나만 죽었을 때 죽은 좌석을 대표로 뽑으면 '미기동' 오판이 나고,
+    #   그 오판이 결손>0 → 불필요한 스폰·재선언 churn(자가치유가 아니라 자가교란)으로 번진다.
+    _RANK = {"awake_confirmed": 3, "alive_presumed": 2, "unknown": 1, "absent": 0}
+    verdicts = {}
+    for r in required:
+        sat, filler, native, why = slot_satisfied(r, live)
+        if bn is None:
+            grade, greason = (("alive_presumed", "공유 술어 소비 불가 — 좌석 존재로 추정")
+                              if sat else ("absent", "공유 술어 소비 불가"))
+        elif not sat:
+            grade, greason = bn.node_liveness(status, filler or r)
+        else:
+            # 요건을 충족하는 **전 동족 좌석**을 평가해 최선 등급을 취한다(대표 선택의 결정론화).
+            cands = sorted(c for c in live if bn.role_matches_requirement(r, c))
+            if filler and filler not in cands:
+                cands.append(filler)          # 대체 좌석(슬롯 폴백)도 후보에 포함
+            best = max(((bn.node_liveness(status, c), c) for c in cands),
+                       key=lambda t: _RANK.get(t[0][0], 0))
+            (grade, greason), filler = best[0], best[1]
+            # native = 요건 이름공간(정확일치·worker 접두)으로 충족됐는가. 대체 슬롯 좌석
+            # (reviewer-claude-N)이 대표가 되면 False → 실충전자 라벨링이 켜진다(B2 정직 강등).
+            native = bn.role_matches_requirement(r, filler)
+        # 좌석은 있는데 각성/생존 신호가 전부 없으면(absent) 충족이 아니다 — 이름공간과 생존을
+        # 함께 본다. 단 unknown(판정불가)은 좌석 존재 시 충족측으로 접는다(fail-open은 여기가
+        # 정당하다: check 는 파괴 행위를 하지 않고, unknown 에서 적색을 내면 콜드스타트마다 위경보).
+        satisfied = bool(sat) and grade != bn.LIVENESS_ABSENT if bn is not None else bool(sat)
+        verdicts[r] = {"satisfied": satisfied, "grade": grade, "filler": filler,
+                       "native": native, "why": "%s · %s" % (why, greason)}
+    return verdicts, roster
+
+
+def _shared_verdict_deficit(status, requery=None, tick_s=None):
+    """★부트 경로 전용 결손 산출(W-B1 ③) — (결손 bool, 사유) | (None, 소비불가 사유).
+
+    check_verdicts(⑤check 의 판정 코어)를 **소비만** 하고 그 satisfied 를 재정의하지 않는다.
+    ⑤check 와의 유일한 의도적 차이 = **unknown 등급의 계상 방향**:
+      · ⑤check: unknown = 충족측(fail-open — check 는 파괴 행위가 없고, 콜드스타트 창
+        (watchdog 첫 틱 전 = 전 좌석 unknown)에서 적색을 내면 위경보·exit 6 라이브락이다)
+      · 결손 산출(여기): unknown = **시한부 해소 후 잔존 시 결손**(스폰측 fail-open —
+        `cys boot` 호출을 유도한다. 죽었는데 프로브만 실패한 좌석이 '충족'으로 접혀 boot 가
+        영영 생략되는 잔여 B3 를 닫는다. 중복 스폰은 boot 락 + `cys boot` 자체의 Unknown
+        시한부 해소 + seat_death_confirmed 죽음확정 게이트가 3중으로 방어한다).
+    ★check_verdicts 본체에 넣지 않는 이유(감사 확정): 결손 판정과 ⑤check 가 같은 함수라
+      **동시에** 뒤집혀, 데몬 콜드스타트 창에서 노드가 다 살아 있는데도 ⑤check 실패 →
+      exit 6 라이브락이 된다. 그래서 갈래는 여기(결손 산출 전용 함수)다 — ⑤ satisfied 불변.
+
+    시한부 해소는 `javis_boot_node.resolve_unknown_for_spawn`(워치독 1주기 대기 → 재조회 1회
+    → 잔존 불명 = 결손 취급)을 **그대로 소비**한다 — `cys boot` 스폰 경로가 이미 쓰는 규약과
+    동일(신술어 발명 금지). 대기 1주기는 **역할 수와 무관하게 1회**다(재조회 status 공유 —
+    unknown 좌석이 N 개라고 5s×N 을 태우면 부트 경로 예산이 계약 없이 부푼다).
+
+    ★소비 배선 현황(정직 표기 · 2026-08-21 배선 완료 · W-B3): 이 함수가 **정본**이고
+      소비자는 `javis_bootstrap._shared_verdict_deficit` 위임 래퍼다(④ boot 호출 생략 판정).
+      bootstrap 의 로컬 구현은 `_shared_verdict_deficit_fallback` 으로 개명돼 **구 팩 스큐
+      (이 함수 부재·import 실패·위임 예외) 전용 폴백**으로만 남았고, 폴백 발동은 stderr 1줄로
+      고지된다(조용한 강등 금지). 배선 시 주의 2건은 **둘 다 이행 완료**다:
+      ①반환 계약 (bool|None, 사유) 3자(정본·래퍼·폴백) 동일 — 실측 대조 완료.
+      ②run_bootstrap_health H-PRED-1 의 '결손↔check 차분 0' 계약은 seat_unknown corpus 의
+      **의도된 차분**(check 충족 vs 결손>0)을 예외로 두도록 개정됐고, 배선 실재·폴백 실재·
+      ⑤check satisfied 불변을 그 검체가 함께 핀한다(소비자 0 재발 시 적색).
+
+    requery/tick_s 는 밀폐 테스트 주입(기본: cys_status 재조회 · 워치독 1주기 대기)."""
+    bn = _boot_node()
+    try:
+        verdicts, _roster = check_verdicts(status)
+    except Exception as e:
+        return None, "check_verdicts 소비 불가(%s: %s)" % (type(e).__name__, e)
+    if not verdicts:
+        return None, "check_verdicts 빈 판정(로스터 산출 실패)"
+    missing = [r for r, v in verdicts.items() if not v.get("satisfied")]
+    if missing:
+        return True, ("공유 판정 결손(의무 %s / 부재 %s) — 결손 존재 [신호=check_verdicts 동일]"
+                      % (", ".join(verdicts), ", ".join(missing)))
+    unknowns = [(r, v.get("filler") or r) for r, v in verdicts.items()
+                if v.get("grade") == (bn.LIVENESS_UNKNOWN if bn is not None else "unknown")]
+    if unknowns and bn is not None:
+        # 워치독 1주기 대기·재조회는 **전 역할 공유 1회**(첫 역할만 tick 대기, 이후 0) —
+        # 재조회 결과를 메모해 같은 status 로 전 unknown 을 재판정한다.
+        fresh = {}
+
+        def _requery():
+            if "st" not in fresh:
+                fresh["st"] = requery() if requery is not None else cys_status()
+            return fresh["st"]
+
+        residual = []
+        for i, (req_role, seat_role) in enumerate(unknowns):
+            grade, why = bn.resolve_unknown_for_spawn(
+                seat_role, _requery, tick_s=(tick_s if i == 0 else 0))
+            if grade == bn.LIVENESS_ABSENT:
+                residual.append("%s(%s)" % (req_role, why))
+        if residual:
+            return True, ("부트 경로 unknown 결손(판정불가 잔존: %s) — 결손 존재 "
+                          "[⑤check satisfied 는 불변·시한부 해소=resolve_unknown_for_spawn]"
+                          % "; ".join(residual))
+        return False, ("공유 판정 충족(의무 %s 전원 — unknown %d건 전부 시한부 해소로 생존 확인)"
+                       " — 결손 0(재선언) [신호=check_verdicts+unknown 시한부 해소]"
+                       % (", ".join(verdicts), len(unknowns)))
+    presumed = [r for r, v in verdicts.items()
+                if v.get("satisfied") and v.get("grade") == "alive_presumed"]
+    note = ("" if not presumed
+            else " · 생존추정(각성 미확인) %s — 재각성 권장이나 결손 아님" % ", ".join(presumed))
+    return False, ("공유 판정 충족(의무 %s 전원) — 결손 0(재선언)%s [신호=check_verdicts 동일]"
+                   % (", ".join(verdicts), note))
 
 
 # ── check: 4종 의무 노드 생존 판정 ──
@@ -206,21 +563,13 @@ def cmd_check(args):
     if status is None:
         print("[orchestra check] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행")
         return 2
-    # ★유효 의무 역할 = cso·worker + 감지 폴백 적용 리뷰어 로스터(agy/codex 미감지 시 Claude 대체).
-    roster = reviewer_roster()
-    required = ["cso", "worker"] + [e["role"] for e in roster]
-    alive = live_roles(status)
-    # 워커는 복수 인스턴스(worker, worker-2 …) — 하나라도 생존이면 'worker' 요건을 충족(접두 수용).
-    # 데몬이 둘째 워커부터 worker-N으로 dedup하므로 'worker' 키가 없을 수 있다.
-    if any(v for k, v in alive.items() if k == "worker" or k.startswith("worker-")):
-        alive["worker"] = True
-    # 각성 이력 있는 idle 노드(set-status 노후화·agent_alive None 으로 굳음)만 '생존추정'으로 보강.
-    # ★프로세스 단독 인증 아님(각성이력=status.state 필수·surface_ref 결박) — codex R1 결함5·R2 결함1·5 정합.
-    still_missing = [r for r in required if not alive.get(r)]
-    estimated = _quiet_alive_roles(status, still_missing) if still_missing else {}
-    alive.update(estimated)
+    # ★판정은 순수 함수(check_verdicts)에 있고 여기는 표현만 한다 — 같은 함수를 bootstrap 결손
+    #   판정·wakeup zombie 가드·reclaim 이 소비하므로 판정 이원화가 구조적으로 불가능하다(A1 클래스).
+    verdicts, roster = check_verdicts(status)
+    required = list(verdicts.keys())
+    alive_optional = live_roles(status)
     print("LLM orchestrating 노드 점검 (4종 의무 + grok 선택):")
-    # 리뷰어 대체 고지(오너 2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
+    # 리뷰어 대체 고지(2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
     for e in roster:
         if not e["native"]:
             print("  ⚠ %s 미감지(%s) → %s(Claude 대체) — 보편적이나 벤더 다양성 약함, "
@@ -228,21 +577,28 @@ def cmd_check(args):
                   % (e["substituted_for"], e["reason"], e["role"]))
     missing = []
     for r in required:
-        if alive.get(r):
-            if estimated.get(r):
-                # fresh 각성이 아니라 '각성이력+프로세스' 추정 — 재각성(헬퍼) 권장 신호.
-                print("  ✓ %s — 생존추정(set-status 노후·프로세스 생존 · 재각성 권장)" % r)
-            else:
-                print("  ✓ %s — 생존" % r)
-        else:
-            print("  ✗ %s — 미기동" % r)
+        v = verdicts[r]
+        if not v["satisfied"]:
+            print("  ✗ %s — 미기동 (%s)" % (r, v["why"]))
             missing.append(r)
+            continue
+        # ★B2 실충전자 라벨링 — 대체 좌석이 슬롯을 채웠으면 그 사실을 숨기지 않는다.
+        fill = "" if v["native"] in (True, None) or v["filler"] == r else \
+               " ← 실충전자 %s(대체)" % v["filler"]
+        if v["grade"] == "awake_confirmed":
+            print("  ✓ %s — 각성 확정(%s)%s" % (r, v["why"], fill))
+        elif v["grade"] == "unknown":
+            print("  ✓ %s — 좌석 판정불가(프로브 실패 — 적색 아님·재확인 권장)%s" % (r, fill))
+        else:
+            # agent_alive 단독·좌석 점유·quiet_but_alive — 각성 확정이 아니다(B6 강등 라벨).
+            print("  ✓ %s — 생존추정(각성 미확인 · 재각성 권장: %s)%s" % (r, v["why"], fill))
     for r in OPTIONAL_ROLES:
-        print("  %s %s — %s" % ("✓" if alive.get(r) else "·", r,
-                                "생존" if alive.get(r) else "미설치/미기동(선택)"))
+        print("  %s %s — %s" % ("✓" if alive_optional.get(r) else "·", r,
+                                "생존" if alive_optional.get(r) else "미설치/미기동(선택)"))
     if missing:
-        only_rev = all(m.startswith("reviewer") for m in missing)
-        howto = ("javis_orchestra.py boot-reviewers (리뷰어 감지·자동 폴백)" if only_rev
+        # ★B1 정책 열 소비: 부재가 전부 Degrade(리뷰어)면 처방은 boot-reviewers(대체 폴백 포함)다.
+        only_degrade = all(plan_policy(m) == FAIL_DEGRADE for m in missing)
+        howto = ("javis_orchestra.py boot-reviewers (리뷰어 감지·자동 폴백)" if only_degrade
                  else "cys boot")
         print("종합: 필수 %d/%d 생존 — 부재: %s → `%s`로 기동하라"
               % (len(required) - len(missing), len(required), ", ".join(missing), howto))
@@ -252,47 +608,120 @@ def cmd_check(args):
 
 
 # ── boot-reviewers: 리뷰어 감지→기동, 미감지 시 Claude 대체 자동 폴백(멈춤 없음) ──
-def _boot_one_node(role, agent, timeout=130):
-    """javis_boot_node.py 로 단일 노드 결정론 부트. rc==0(각성확정) → True."""
-    bn = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_boot_node.py")
+# ─────────────────── A12: 호출 exit 분류 (transient vs permanent) ───────────────────
+# ★재감사 A12: 674행 '죽은 초기화'가 설계 의도 소실의 물증이었다 — 모든 비0 을 뭉개 재시도하면
+#   영구 실패(스크립트 부재·인터프리터 깨짐)를 24회 재시도로 태우고 정확한 처방을 잃는다.
+#     2   = 치명(데몬 다운·인자 오류)   → **영구**: 즉시 fail + 정확 처방(재시도 금지)
+#     127 = 명령/스크립트 부재          → **영구**: 즉시 fail + 설치·경로 처방(재시도 금지)
+#     124 = timeout(부트가 느림)        → **transient**: 재시도 가치 있음
+#     그 밖 비0(1 등) = 실측 미확정      → transient(보수 — 종전 동작 보존)
+EXIT_CLASS_PERMANENT = "permanent"
+EXIT_CLASS_TRANSIENT = "transient"
+EXIT_CLASS_OK = "ok"
+
+
+def classify_call_exit(rc, target="호출"):
+    """순수 판정: 서브프로세스 rc → (class, 처방). class ∈ ok|permanent|transient."""
+    if rc == 0:
+        return EXIT_CLASS_OK, "성공"
+    if rc == 2:
+        return EXIT_CLASS_PERMANENT, (
+            "%s 치명(exit 2 — 데몬 다운 또는 인자 오류): 재시도는 무의미하다. "
+            "`cys ping` 으로 데몬을 확인하고 인자를 점검하라." % target)
+    if rc == 127:
+        return EXIT_CLASS_PERMANENT, (
+            "%s 부재(exit 127 — 스크립트/인터프리터 없음): 재시도는 무의미하다. "
+            "팩 경로(CYS_PACK_DIR)와 python 해소를 점검하라." % target)
+    if rc == 124:
+        return EXIT_CLASS_TRANSIENT, "%s timeout(exit 124) — 예산 내 재시도 가치 있음" % target
+    return EXIT_CLASS_TRANSIENT, "%s 실패(exit %s) — 실측 미확정, 보수적으로 재시도 대상" % (target, rc)
+
+
+def _boot_node_outer_timeout():
+    """_boot_one_node 가 씌우는 외부 상한 — javis_budget 파생(하드코딩 금지·B9 역전 해소)."""
     try:
-        r = subprocess.run([sys.executable, bn, "--role", role, "--agent", agent],
-                           timeout=timeout)
-        return r.returncode == 0
+        import javis_budget as _b
+        return float(_b.boot_node_outer_s())
     except Exception:
-        return False
+        return 130.0
+
+
+def _boot_one_node(role, agent, timeout=None):
+    """javis_boot_node.py 로 단일 노드 결정론 부트 → (ok, rc, exit_class, 처방).
+
+    ★B9 데드라인 전파: 외부 상한을 javis_budget 에서 파생하고 **같은 예산을 `--timeout` 으로
+      하위에 전달**한다. 종전엔 외부 130s 가 내부(90s + 데드라인 무시 서브프로세스 80s)를 넘지
+      못해 정상 진행 중인 부트를 잘랐다(예산 역전 2/3).
+    ★A12: rc 를 분류해 영구 실패는 재시도하지 않고 처방을 낸다.
+    """
+    outer = float(timeout) if timeout else _boot_node_outer_timeout()
+    inner = max(10.0, outer - 12.0)      # 하위 데드라인 < 외부 상한(잔여 granularity 확보)
+    bn = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_boot_node.py")
+    if not os.path.isfile(bn):
+        cls, why = classify_call_exit(127, "javis_boot_node.py")
+        return False, 127, cls, why
+    try:
+        r = subprocess.run([sys.executable, bn, "--role", role, "--agent", agent,
+                            "--timeout", "%.0f" % inner], timeout=outer)
+        rc = r.returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+    except Exception:
+        rc = 2
+    cls, why = classify_call_exit(rc, "boot_node(%s)" % role)
+    return rc == 0, rc, cls, why
 
 
 def cmd_boot_reviewers(args):
-    """★오너 2026-06-14: master 부트 후 리뷰어(agy·codex)를 '호출하는 단계'.
+    """★2026-06-14: master 부트 후 리뷰어(agy·codex)를 '호출하는 단계'.
     감지를 못하면 멈추지 말고 곧바로 Claude 대체 리뷰어로 폴백 기동한다.
     2층 감지: (1) 바이너리 미설치 → 즉시 대체(detect_reviewer). (2) 설치됐으나 부트가
     각성(set-status ack)에 실패(미인증·깨짐) → 대체로 2차 폴백. 절대 halt 하지 않는다."""
     roster = reviewer_roster()
     print("[boot-reviewers] 리뷰어 슬롯 기동 (미감지/각성실패 시 Claude 대체로 자동 폴백):")
     results = []
+    fillers = []          # ★B2: 슬롯을 **실제로 채운** 역할 — check 재해소의 근거(라벨링 대상)
     for (nrole, nagent, srole, sagent), e in zip(REVIEWER_SLOTS, roster):
         role, agent = e["role"], e["agent"]
         if not e["native"]:
             print("  ⚠ %s 미감지(%s) — %s(Claude) 대체 기동" % (nagent, e["reason"], srole))
         if args.plan:
-            print("  · PLAN %-18s ← %s%s" % (role, agent,
+            print("  · PLAN %-18s ← %-8s [%s]%s" % (role, agent, plan_policy(nrole),
                   "" if e["native"] else " (대체: %s 부재)" % nagent))
             results.append("plan")
+            fillers.append({"slot": nrole, "filler": role, "native": e["native"]})
             continue
-        ok = _boot_one_node(role, agent)
+        ok, rc, cls, why = _boot_one_node(role, agent)
         if not ok and e["native"]:
+            if cls == EXIT_CLASS_PERMANENT:
+                # ★A12: 영구 실패(스크립트 부재·데몬 다운)는 대체 폴백으로도 못 고친다 —
+                #   같은 헬퍼를 다시 부르면 같은 영구 실패다. 정확 처방만 내고 재시도하지 않는다.
+                print("  ✗ %-18s ← %s — 영구 실패: %s" % (role, agent, why))
+                results.append("failed")
+                fillers.append({"slot": nrole, "filler": None, "native": None})
+                continue
             # 설치됐으나 각성 실패(미인증·깨짐) — 2차 폴백: Claude 대체로 전환
-            print("  ⚠ %s 기동/각성 실패 — %s(Claude) 대체로 2차 폴백" % (role, srole))
-            role, agent, ok = srole, sagent, _boot_one_node(srole, sagent)
-        print("  %s %-18s ← %s" % ("✓" if ok else "✗", role, agent))
+            print("  ⚠ %s 기동/각성 실패(%s) — %s(Claude) 대체로 2차 폴백" % (role, why, srole))
+            role, agent = srole, sagent
+            ok, rc, cls, why = _boot_one_node(srole, sagent)
+        print("  %s %-18s ← %s%s" % ("✓" if ok else "✗", role, agent,
+                                     "" if ok else " — %s" % why))
         results.append("awake" if ok else "failed")
+        fillers.append({"slot": nrole, "filler": role if ok else None,
+                        "native": (role == nrole) if ok else None})
     awoke = sum(1 for s in results if s in ("awake", "plan"))
+    # ★B2 실충전자 고지 — ⑤check 는 slot_satisfied 로 같은 사실을 재해소한다(대체 좌석=슬롯 충족).
+    for f in fillers:
+        if f["filler"] and f["native"] is False:
+            print("  ↳ 슬롯 %s 는 대체 좌석 %s 가 충전 — check 는 이 좌석으로 슬롯을 재해소한다"
+                  " (영구 적색·재선언 불회복 차단)" % (f["slot"], f["filler"]))
     if args.plan:
         print("종합(PLAN): 리뷰어 %d슬롯 — 감지 폴백 적용 로스터 출력(기동 안 함)" % len(results))
         return 0
     print("종합: 리뷰어 %d/2 각성 (Claude 대체 포함)%s"
           % (awoke, "" if awoke >= 2 else " — 부족: master 가 점검·수동 재기동"))
+    # ★B1 정책: 리뷰어는 Degrade 다 — 부족은 **경고**로 강등하고 상위 체인(④-b→⑤)을 계속시킨다.
+    #   비0 을 유지하되 소비부(javis_bootstrap ④-b)는 이 exit 로 부트를 죽이지 않는다(exit 4=Fatal 만).
     return 0 if awoke >= 2 else 1
 
 
@@ -439,9 +868,14 @@ def cmd_review_prompt(args):
     lines.append("")
     lines.append("리뷰 형식: [문제점] [논쟁점] [다음 단계 조언] — 각 지적에 파일:라인 또는 구체 근거.")
     lines.append("근거 없는 인상비평·칭찬만 하는 리뷰 금지. 결함을 찾는 것이 직무다.")
+    # ★전환 게이트 §9-7-2 부수 2: 라운드 목표는 고정 향상률이 아니라 "잠근 합격 기준"이다
+    # (운영계약 §7-1 통과 조건 · §7-6 고정 향상률 문구 전면 금지). 점수(0-100)는 §6-4가
+    # 금지한다 — 평균·다수결 affordance 차단. 이 줄은 라운드 무관하게 항상 주입된다.
+    lines.append("통과 조건: **잠근 합격 기준의 미달 항목 0** — 점수(0-100)·고정 향상률 목표는 금지. "
+                 "판정은 verdict enum(ACCEPT|REVISE|BLOCK|ESCALATE) + evidence(file:line)로만 한다.")
     if rnd and rnd > 1:
-        lines.append("라운드 %d: 직전 산출물을 해당 분야 최고 전문가 관점으로 평가하고 "
-                     "**직전 점수 +10%%** 목표로 본다. 단순 코드수정이 아니라 재귀적 개선 관점으로." % rnd)
+        lines.append("라운드 %d: 직전 산출물을 해당 분야 최고 전문가 관점으로 재귀적 개선 관점에서 "
+                     "평가한다(단순 코드수정 금지). 이 라운드의 종결 조건도 위 통과 조건과 같다." % rnd)
     lines.append("회신: `cys send --queued --to master \"[리뷰] ...\"` (자동 Return 배달 — "
                  "타이핑 가드 안전·send-key 불필요).")
     print("\n".join(lines))
@@ -603,10 +1037,118 @@ def resolve_manifest_phase(manifest, phase_id):
         return None, []
 
 
-def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None):
+# ── todo 선언 블록 v1 (설계 DESIGN_declared-state.md §4-1 · 생산자 P3) ──────────────
+# 유령 todo 사고의 근저원인은 소비자가 파일명·경로·mtime으로 소유권을 **추론**한 것이다.
+# 추론을 없애려면 파일 자신이 소유를 **선언**해야 한다. 그런데 선언을 워커 손기재에 맡기면
+# 실측상 오작성 6종 중 5종(따옴표·값 공백·키 누락·대문자 키·후행 주석)이 미선언으로 떨어진다
+# — 그래서 티켓 발부 시점에 **완성된 한 줄**을 기계 생성해 동봉한다(손기동 자체를 줄인다).
+DECL_VALUE_BAD_RE = re.compile(r"[^A-Za-z0-9._:-]+")
+DECL_VALUE_OK_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+# 파서는 단일 구현이다(재구현 금지 — ADR-2 2언어 파리티 계약의 Python 측). 생성한 선언을
+# 파서에 되먹여 `counted`가 나오는지 확인하는 것이 유일한 계약 준수 증명이다.
+# ⚠팩 부분갱신 스큐(ADR-2)로 파서가 없을 수도 있다 — 그때는 왕복 검증만 생략하고 문법 검사는
+#   그대로 유지한다(여기서 예외를 던지면 팩 스큐 한 번에 위임 전체가 죽는다).
+try:
+    import javis_todo_decl as _decl                                       # noqa: E402
+except Exception:                                                         # pragma: no cover
+    _decl = None
+
+
+def _pack_identity():
+    """팩 **경로**와 **정체성(scope)** 을 한 번의 조회로 **함께** 확정한다.
+
+    ★W14 S14 — 이것이 이 함수의 존재 이유다. 종전에는 티켓의 todo 경로가
+    `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/…` 문자열이라 **워커 셸에서 늦게** 전개되고,
+    같은 티켓의 선언 `scope=`는 **master 프로세스에서 즉시** 확정됐다. 두 바인딩이 같다는
+    보증이 아무 데도 없었다. 실측 재현 — master가 `scope=pack`으로 발부한 티켓을 워커가
+    `pack-dept-dept-1` 팩에서 기록하면 소비자는 `excluded=[('worker','foreign-scope',0,2)]`,
+    `pending_outside=[]`(주인이 명시한 처분이라 면제) → **false QUIET → 세션 주차**다.
+    경로와 정체성은 **같은 시점·같은 값**에서 나와야 한다.
+    """
+    root = os.path.abspath(os.path.normpath(pack_dir()))
+    return root, os.path.basename(root)
+
+
+def decl_value_strict(raw):
+    """**정체성 값**(owner·scope) 검증 — 접지 않고, 폴백도 없다. 위반이면 `None`.
+
+    ★W14 S14 — 종전 `decl_value`는 허용 밖 문자를 `-`로 접고 남는 게 없으면 `"pack"`으로
+    폴백했다. 팩 basename이 G4 문자집합 밖(예: `자비스`)이면 scope가 통째로 `pack`이 되어
+    **그럴듯하지만 틀린 정체성**을 배포했다 — 그 선언을 받은 파일은 진짜 팩에서 `foreign-scope`
+    로 **조용히 배제**된다. 유령을 막으려던 장치가 살아있는 작업을 지우는 정확한 형태다.
+
+    같은 상황에서 스탬프 도구(`javis_todo_stamp.build_decl_line`)는 **정반대로** 시끄럽게
+    실패했다(`선언 생성 실패(bad-token: …)`). 두 생산자가 반대로 행동하는데 어느 쪽이 정본인지
+    계약이 없었고, master 심판은 **시끄러운 쪽**이다 — 추측한 정체성보다 없는 선언이 안전하다
+    (선언이 없으면 소비자가 `unclaimed`로 fail-open 보고한다 · ADR-3).
+    """
+    s = (raw or "").strip()
+    return s if DECL_VALUE_OK_RE.match(s) else None
+
+
+def decl_slug(raw):
+    """**진단 값**(lane) 전용 슬러그 — 여기서만 접는다. 정체성(owner·scope)에는 쓰지 마라.
+
+    lane은 판정에 쓰이지 않는 사람용 표식이라(설계 §4-1 필드 표) 접어도 오배제를 낳지 않는다.
+    남는 게 없으면 빈 문자열이고, 호출자는 그때 **키를 통째로 생략**한다(빈 값은 선언 전체를
+    무효화한다 — G4 값은 1글자 이상).
+    """
+    return DECL_VALUE_BAD_RE.sub("-", (raw or "").strip()).strip("-.:_")
+
+
+def todo_decl_line(to_role, task=None, today=None, scope=None):
+    """티켓에 동봉할 선언 한 줄(v1). 반환 = `(line, None)` 또는 **`(None, 사유)`**.
+
+    키 순서·필수 3종(owner·scope·status)은 설계 §4-1 고정. `scope`는 role 생존이 아니라
+    **팩 정체성**이다 — owner 노드가 죽어도 선언은 파일에 남아 미완 작업이 노드 수명과
+    분리된다. 값은 호출자가 `_pack_identity()`로 확정해 넘기며(경로와 **같은 바인딩**),
+    생략 시 여기서 같은 함수로 조회한다.
+
+    `lane`·`since`는 판정에 쓰지 않는 진단용이라, lane 슬러그가 비면 키를 통째로 생략한다.
+
+    ★실패는 시끄럽다(W14 S14). 정체성 값이 G4를 어기면 접거나 폴백하지 않고 사유를 돌려준다.
+    ★생성물은 **파서에 되먹여** 검증한다(스탬프 도구 `build_decl_line`과 같은 왕복 패턴) —
+      문법 검사식을 여기 다시 적으면 그중 하나는 반드시 뒤처지고, 뒤처진 쪽이 소비자와 갈린다.
+    """
+    if scope is None:
+        _, scope = _pack_identity()
+    owner_v = decl_value_strict(to_role)
+    scope_v = decl_value_strict(scope)
+    if owner_v is None or scope_v is None:
+        bad = "owner=%r" % to_role if owner_v is None else "scope=%r" % scope
+        return None, ("선언 값이 G4 문자집합(`[A-Za-z0-9._:-]+`)을 벗어난다: %s" % bad)
+
+    parts = ["owner=%s" % owner_v, "scope=%s" % scope_v]
+    lane = decl_slug(task)[:48].strip("-.:_")
+    if lane:
+        parts.append("lane=%s" % lane)
+    parts.append("status=active")
+    parts.append("since=%s" % (today or time.strftime("%Y-%m-%d")))
+    line = "<!-- javis:todo v1 %s -->" % " ".join(parts)
+
+    if _decl is not None:                       # 파서 왕복 검증(계약 준수의 유일한 증명)
+        d, diag = _decl.parse(line + "\n")
+        if d is None:
+            return None, "선언 생성 실패(%s: %s)" % (getattr(diag, "code", "?"), diag)
+        if _decl.classify(d, scope_v, lambda s: True) != "counted":
+            return None, "선언 생성 실패(counted 미달)"
+    return line, None
+
+
+def todo_file_name(role):
+    """역할 → todo 파일명. 생산자 3곳(P1 `cys todo-path` · P2 cycle 저장검증 · P3 여기)이
+    **같은 규칙**을 쓴다: 대문자화 + 하이픈→언더스코어."""
+    return "%s_TODO.md" % role.upper().replace("-", "_")
+
+
+def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
     (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증).
-    tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical)."""
+    tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical).
+    probes(P3 · 설계 §4 컴포넌트 C): 이 태스크의 필수 probe 이름 리스트. 지정 시 '필수 probe' 블록
+    삽입, 빈/None이면 블록 부재 → 기존 티켓과 byte-identical(하위호환). E1 evidence-artifact 게이트와
+    는 별개·보완 채널(E1=산출물 파일 `--evidence-artifact`, P3=`--evidence` 텍스트 증거범주·probe 영수증)."""
     bullets = rules
     lines = []
     lines.append("[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]")
@@ -626,15 +1168,73 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
     lines.append("절대 강조 4규칙 (WORKER_DIRECTIVE §3 — 모든 작업에 적용·위반 금지):")
     lines.extend("  " + b for b in bullets)
     lines.append("")
-    # 경로는 pack 앵커 절대경로 — javis_report의 todo 스캔 루트(pack/round)와 일치해야
-    # 진행% 집계에 잡힌다(상대경로 'round/'는 워커 cwd에 따라 집계 누락 — 적대 검증 R1).
-    lines.append("todo 영속: 이 작업을 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/round/%s_TODO.md\"에 "
-                 "분해하고 세부 완료마다 체크박스를 갱신하라(진행%% 집계 원천)."
-                 % to_role.upper().replace("-", "_"))
+    # ★W14 S14 — 경로와 선언 `scope`를 **같은 시점·같은 조회**에서 확정한다.
+    #
+    # 종전에는 경로가 `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/…` 문자열이라 **워커 셸에서 늦게**
+    # 전개되고 선언 scope는 **master 프로세스에서 즉시** 확정됐다. 두 바인딩이 같다는 보증이
+    # 없었고, 갈리면 워커가 만든 파일이 자기 팩에서 `foreign-scope`로 **조용히 배제**된다
+    # (실측: excluded=[('worker','foreign-scope',0,2)] · pending_outside=[] → false QUIET → park).
+    # 지금은 master가 확정한 **절대경로**를 티켓에 박는다 — 발부자와 수행자가 같은 팩을 가리킨다.
+    pack_root, scope_id = _pack_identity()
+    todo_path = os.path.join(pack_root, "round", todo_file_name(to_role))
+    lines.append("todo 영속: 이 작업을 \"%s\"에 "
+                 "분해하고 세부 완료마다 체크박스를 갱신하라(진행%% 집계 원천). "
+                 "경로는 발부 시점에 확정된 절대경로다 — 다른 팩에 만들면 집계에서 배제된다."
+                 % todo_path)
+    # ★todo 선언(설계 §4-1) — 집계기는 파일명·경로·mtime이 아니라 이 선언으로 귀속을 판정한다.
+    # 위치 계약(첫 체크박스 이전)은 협상 대상이 아니다: 체크박스 뒤의 선언을 인정하면 본문에
+    # 적힌 문구가 스스로를 무효화하는 자해 경로가 열린다(A2 회귀).
+    decl, why = todo_decl_line(to_role, task, scope=scope_id)
+    if decl is not None:
+        lines.append("todo 선언(위 파일을 새로 만들 때 **첫 체크박스보다 위**, 머리말 첫 줄에 아래 한 줄을 "
+                     "그대로 복사하라 — 집계기는 파일명이 아니라 이 선언으로 소유·귀속을 판정한다. "
+                     "따옴표 추가·값에 공백·키 대문자화는 전부 '미선언'으로 떨어지니 한 글자도 고치지 마라. "
+                     "이미 선언이 있는 파일이면 다시 넣지 마라 — 선언이 2개면 모호성으로 미선언 처리된다. "
+                     "레인·스테이지가 끝나면 `status=active`를 `status=retired`로 바꿔 은퇴를 선언하라):")
+        lines.append("  %s" % decl)
+    else:
+        # ★실패는 시끄럽다(S14). 접어서 그럴듯한 정체성(`scope=pack`)을 배포하지 않는다 —
+        # 틀린 정체성은 살아있는 파일을 남의 레인으로 **조용히** 배제시키고, 그 배제는 QUIET
+        # 불변식의 면제 대상이라 마지막 방어선조차 통과한다. 선언이 아예 없으면 소비자는
+        # `unclaimed`로 fail-open 보고한다(ADR-3) = 시끄럽지만 안전한 쪽이다.
+        sys.stderr.write("javis_orchestra: todo 선언을 생성하지 못했다 — %s "
+                         "(role=%s scope=%s)\n" % (why, to_role, scope_id))
+        lines.append("todo 선언: **생성 실패** — %s. 선언 없이 파일을 만들어라(집계기가 "
+                     "`unclaimed`(미선언)로 시끄럽게 보고한다). 임의로 값을 고쳐 넣지 마라 — "
+                     "틀린 `scope`는 이 파일을 '남의 레인'으로 **조용히** 배제시켜 진행률에서 "
+                     "사라지게 만든다. 팩 이름을 G4 문자집합(`[A-Za-z0-9._:-]+`)으로 바로잡은 뒤 "
+                     "`cys todo-path --emit-decl`로 다시 받아라." % why)
     lines.append("보고 채널: 완료·질문·충돌·막힘은 `cys send --queued --to master \"[보고] ...\"` "
                  "로 직접 push하라(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 "
                  "안전). 즉시 끼어들어야 할 긴급 보고만 직접 send 후 `cys send-key --to master "
                  "Return`(가드 차단 시 --queued로 전환).")
+    # done 증거 게이트(P3 · 설계 §2.2·§4 컴포넌트 C) — E1 산출물 파일 게이트와 나란히 공존하는
+    # 별개·보완 채널: E1=검증 산출물 **파일**(--evidence-artifact), 여기=`--evidence` **텍스트**의
+    # 증거 범주(negative-case/실데이터)와 probe 영수증 대조. 문구 중복·모순 없이 둘 다 명시한다.
+    lines.append("done 증거 게이트(P3): `--evidence` 텍스트는 ①negative-case(고장 입력 검증) 또는 "
+                 "②실데이터(합성 픽스처 아님) 검증 결과를 담을 것. probe를 실행했으면 `probe:<name>` "
+                 "토큰을 `--evidence`에 명시하라(done 전이 시 probe 영수증 자동 대조). "
+                 "※아래 E1은 검증 산출물 **파일**(`--evidence-artifact`) 채널 — 둘은 별개·보완이다.")
+    # 필수 probe 블록은 probes 지정 시에만 삽입 — 미지정이면 라인 부재(하위호환·byte-identical).
+    # ★--task 동반 필수(R1 major-a): 영수증 대조는 (probe명∧exit0∧최근성∧target 일치)이고
+    #   relaxed probe(submit·ctx-compare·kill-preflight)의 target은 --task로만 바인딩된다 —
+    #   --task 없는 무-task 영수증은 done 대조에서 대상 불일치로 거부된다. task-prompt는 작업
+    #   서술만 알고 장부 task-id를 모르므로 `<task-id>` 플레이스홀더로 출력하고 워커가 치환한다.
+    if probes:
+        lines.append("필수 probe: 이 작업은 done 전 %s 각각 PASS 영수증 필수 "
+                     "(`python3 ${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_actprobe.py <name> "
+                     "--task <task-id> …` 실행 후 `--evidence`에 `probe:<name>` 토큰 포함). "
+                     "<task-id>는 네 장부 태스크 id로 치환하라 — task-prompt는 작업 서술만 알고 "
+                     "장부 id를 모른다. 미실행·FAIL 시 done 거부." % ", ".join(probes))
+        lines.append("  ⚠ relaxed probe(submit·ctx-compare·kill-preflight)는 `--task` 없이 "
+                     "실행하면 무-task 영수증이 되어 done 대조에서 대상 불일치로 거부된다 — "
+                     "반드시 --task를 동반하라.")
+    # E1 증거의 기계화(설계 §E1): 태스크 done 전이는 실제 검증 산출물 파일을 제출해야 통과(strict).
+    lines.append("완료 증거(E1 evidence-artifact 게이트 · strict): 태스크를 done 처리할 때 검증 산출물"
+                 " 파일(테스트 로그·빌드 출력 등, 권장 위치 `_round/evidence/<task-id>/`)을 만들고 "
+                 "`javis_task.py set-status <id> done --evidence-artifact <경로>`로 제출하라 — "
+                 "파일은 실존·비어있지않음·태스크 착수 이후 신선도를 기계 검사한다(검증 불가 시 "
+                 "--skip-reason, skip_audit.jsonl 감사 기록).")
     if prereq_block:
         lines.append("")
         lines.append(prereq_block)
@@ -694,7 +1294,8 @@ def cmd_task_prompt(args):
     print(build_task_ticket(args.task, args.scope, success, args.to, rules=rules,
                             output_format=getattr(args, "output_format", None),
                             prereq_block=prereq, dont=getattr(args, "dont", None),
-                            tier_hint=getattr(args, "tier", None)))
+                            tier_hint=getattr(args, "tier", None),
+                            probes=_split_csv(getattr(args, "probes", None))))
     return 0
 
 
@@ -779,9 +1380,11 @@ def cmd_round_init(args):
         return 0
     open(p, "w", encoding="utf-8").write(
         "# ORCHESTRATION 라운드 장부 — %s\n\n"
-        "> 절대지침 4차 5-1~5-8. 완료조건: 맥킨지급 도달(외부 리뷰어 판정) 또는 %dR 완료.\n"
-        "> 자기채점 금지 — score는 producer≠evaluator(외부 리뷰어)가 매긴다.\n\n"
-        "| 라운드 | 평가자 | 점수 | 판정 |\n|---|---|---|---|\n" % (args.task, MAX_ROUNDS)
+        "> 라운드 루프(운영계약 §6-5·§6-6). 완료조건: **잠근 합격 기준의 미달 항목 0**"
+        "(외부 리뷰어 판정) 또는 %dR 상한 도달 — 먼저 온 것이 종결 사유다.\n"
+        "> 자기채점 금지 · 점수(0-100) 금지(§6-4) — 판정은 producer≠evaluator(외부 리뷰어)의\n"
+        "> verdict enum + evidence(file:line)다. 기록값 칸은 등급이 아니라 증거 발췌다.\n\n"
+        "| 라운드 | 평가자 | 기록값 | 판정 |\n|---|---|---|---|\n" % (args.task, MAX_ROUNDS)
     )
     print("라운드 장부 생성: %s" % p)
     return 0
@@ -796,7 +1399,10 @@ def cmd_round_log(args):
     p = round_path(args.task)
     if not os.path.exists(p):
         cmd_round_init(args)
-    score, verdict = args.score, args.verdict
+    # ★전환 게이트 §9-7-2 부수 1: --score 플래그를 제거했다(§6-4 점수 금지).
+    #   기록값 칸의 기본은 "-" 이며, --from-cmd 경로에서만 기계검증 출력 꼬리를 담는다
+    #   (등급이 아니라 증거 발췌다 — 평균·다수결 affordance 없음).
+    score, verdict = "-", args.verdict
     machine_fail = False
     # machine 평가자의 결정론 기록(앵커6 축1): --from-cmd는 기계검증 명령을 이 도구가
     # 직접 실행해 exit code로 verdict를 자동 기록한다 — master(전환 이해당사자)의
@@ -860,7 +1466,7 @@ def cmd_round_log(args):
     with open(p, "a", encoding="utf-8") as f:
         f.write("| %d | %s | %s | %s |\n"
                 % (args.round, _cell(args.evaluator), _cell(score), _cell(verdict)))
-    print("기록: 라운드 %d · 평가자 %s · 점수 %s · 판정 %s"
+    print("기록: 라운드 %d · 평가자 %s · 기록값 %s · 판정 %s"
           % (args.round, _cell(args.evaluator), _cell(score), _cell(verdict)))
     # --from-cmd 검증 실패는 exit 1 — 기록은 성공했지만 && 체인이 "검증 통과"로
     # 오독하지 않게 한다(판정의 단일 진실은 gate-status).
@@ -891,12 +1497,14 @@ def cmd_round_status(args):
     print("  기록된 라운드: %d / 상한 %d" % (last, MAX_ROUNDS))
     if rows:
         r = rows[-1]
-        print("  최근: 라운드 %d · 평가자 %s · 점수 %s · 판정 %s"
+        print("  최근: 라운드 %d · 평가자 %s · 기록값 %s · 판정 %s"
               % (r["round"], r["evaluator"], r["score"], r["verdict"]))
     if last >= MAX_ROUNDS:
-        print("  → %dR 상한 도달: 무한 루프 금지. 맥킨지급 미달이면 오너에게 격차 보고하라." % MAX_ROUNDS)
+        print("  → %dR 상한 도달: 무한 루프 금지. 잠근 합격 기준에 미달이면 주인님께 "
+              "격차를 보고하고 추가 라운드 여부를 여쭈어라(운영계약 §6-5)." % MAX_ROUNDS)
         return 0
-    print("  → 다음 라운드 %d 진행 가능(맥킨지급 도달 전까지). 외부 리뷰어가 +10%% 목표로 평가." % (last + 1))
+    print("  → 다음 라운드 %d 진행 가능(잠근 합격 기준의 미달 항목 0 도달 전까지). "
+          "외부 리뷰어가 verdict enum + evidence로 평가한다 — 점수·고정 향상률 금지." % (last + 1))
     return 0
 
 
@@ -992,7 +1600,7 @@ SILENT_FAILURES = [
      "kind": "deterministic"},
     {"id": "SF-ESCALATION-MISSING",
      "source": "§6 라운드 루프 8(10R escalation)",
-     "constraint": "10R 도달·맥킨지급 미달이면 무한루프 금지 + 오너 격차 보고·판단 요청 필수",
+     "constraint": "10R 도달인데 잠근 합격 기준에 미달이면 무한루프 금지 + 주인님께 격차 보고·판단 요청 필수",
      "detection": "기록 라운드>=10 AND 수렴 미달인데 SESSION_STATE에 ESCALATION 레코드+master→owner push가 없으면 위반",
      "kind": "deterministic"},
     {"id": "SF-DIRECTIVE-NOT-INJECTED",
@@ -1111,6 +1719,13 @@ def gate_verdicts(rows, rnd):
     return out
 
 
+# gate-status exit 계약(결정론 환원 — 소비자는 이 코드만 본다):
+#   0=수렴+임무 있음(자동 착수 가) · 1=미수렴 · 2=정직한 SKIP · 4=수렴했으나 임무 미지정(정지).
+# ★4를 3이 아닌 값으로 둔 이유: 3은 `next-action` 이 이미 '임무 미지정'에 쓰고 있어, 같은 숫자를
+#   다른 도구가 다른 의미로 쓰면 소비자 분기가 섞인다. 4는 이 도구에서 미사용이었다.
+GATE_EXIT_NO_MISSION = 4
+
+
 def cmd_gate_status(args):
     p = round_path(args.task)
     if not os.path.exists(p):
@@ -1156,6 +1771,20 @@ def cmd_gate_status(args):
                   "갱신 요건(축1)을 이행했는지 확인하라.", file=sys.stderr)
     except OSError:
         pass
+    # ★T1(2026-08-01 실사고): 축1도 임무 게이트가 선행 조건이다 — 수렴은 '이 산출물이 통과했다'는
+    #   뜻이지 '지금 달려도 된다'는 뜻이 아니다. 오너 임무가 없으면 여기서도 멈추고 보고한다.
+    # ★적발 (c) 수리(2026-08-01 R2): 종전엔 임무 미지정을 감지하고도 **exit 0**(=CONVERGED)을
+    #   냈다. 자연어 경고는 게이트가 아니다 — 소비자는 exit code 만 본다(결정론 환원 원칙).
+    #   그래서 별도 exit 코드로 분기한다:
+    #     0 = 수렴 + 임무 있음 → 자동 착수 가
+    #     4 = **수렴했으나 임무 미지정** → 수렴 사실만 보고하고 정지(자동 착수 금지)
+    #   1(미수렴)·2(정직한 SKIP)와 구분되므로 "왜 멈췄는가"가 exit 하나로 읽힌다.
+    _mrc, _mv = _mission_gate()
+    if _mrc != 0:
+        print("종합: 수렴했으나 **임무 미지정 — 자동 착수 금지**(exit 4). 수렴 사실만 오너에게 "
+              "보고하고 지시를 기다려라(§0-C 임무 게이트).")
+        print("[gate-status] 임무 게이트 미통과: %s" % _mv.get("reason"), file=sys.stderr)
+        return GATE_EXIT_NO_MISSION
     print("종합: GATE CONVERGED — 4자 수렴. 커밋+SESSION_STATE 갱신 후 다음 로드맵 단계를 "
           "자동 착수하라(앵커6 축1 — denylist 해당 시에만 정지).")
     # (RSI 자율추천 ii) 종료 게이트 — slow 작업 수렴(종료) 시 '더 나은 방법' 학습 1회 추천
@@ -1187,15 +1816,28 @@ def _recommend_learn_once(reason, topic, marker_key):
         pass
 
 
-def extract_next_action(text):
-    """SESSION_STATE '## 다음 액션' 섹션의 첫 미완 항목 — 순수 함수(self-test 박제).
+def next_action_items(text):
+    """SESSION_STATE '## 다음 액션' 섹션의 **미완 항목 전량**(순서 보존) — 순수 함수.
 
     지원 형식: 'N. 항목' 번호 목록 · '- [ ] 항목' 체크박스 · '- 항목' 불릿.
-    제외: '(없음)' 류 빈 표시 · 완료 체크(- [x]). 반환: 항목 문자열 또는 None.
+    제외: '(없음)' 류 빈 표시 · 완료 체크(- [x]).
+
+    ★섹션 종료 경계 = 다음 `## ` 헤딩 **또는 예약 블록**(`<!-- CYS:RESERVED:`).
+      종전엔 `## ` 만 경계여서, 팩 기본 템플릿의 예약 블록
+          <!-- CYS:RESERVED:restore_pointer __CYS__RESERVED__ -->
+          - 복원 포인터: (없음)
+      이 **큐 항목으로 계수**됐다. 실효가 치명적이었다 — 큐가 `1. (없음)`(=갓 설치·전 작업
+      완료)인 상태에서도 `extract_next_action` 이 `'복원 포인터: (없음)'` 을 반환해 **exit 0
+      (=자율 착수 가)** 이 났다. 즉 **한 번도 쓰지 않은 SESSION_STATE 로도 자율주행이 시동**됐다
+      (T1 2026-08-01 검증 중 실측 발견 · 아래 self-test 로 박제).
+      ※ `- 복원 포인터: (없음)` 자체는 '없음' 빈-표시 패턴에 걸리지 않는다 — 접두어가 붙어 있어
+        `^[(]?\\s*없음` 매칭이 성립하지 않기 때문이다. 그래서 필터가 아니라 **경계**로 고쳐야 한다.
     """
-    m = re.search(r"(?m)^##\s*다음 액션[^\n]*\n(.*?)(?:\n##\s|\Z)", text, re.S)
+    m = re.search(r"(?m)^##\s*다음 액션[^\n]*\n(.*?)(?:\n##\s|\n<!--\s*CYS:RESERVED:|\Z)",
+                  text, re.S)
     if not m:
-        return None
+        return []
+    out = []
     for ln in m.group(1).splitlines():
         s = ln.strip()
         if not s:
@@ -1217,13 +1859,49 @@ def extract_next_action(text):
         # 빈 표시: '없음' 단독 또는 괄호/구두점 부가 설명만 빈 칸이다 — "없음 처리 로직
         # 구현" 같은 실제 과제명은 빈 칸이 아니다(시작-매칭 과확장 차단, 6차 R2).
         if item and not re.match(r"^[\(（]?\s*없음\s*[\)）.。\s]*([\(（].*)?$", item):
-            return item
-    return None
+            out.append(item)
+    return out
+
+
+def extract_next_action(text):
+    """첫 미완 항목 또는 None(구 계약 보존 — 소비자 다수)."""
+    items = next_action_items(text)
+    return items[0] if items else None
+
+
+def _mission_gate():
+    """(exit_code, verdict) — 판정의 단일 소유자는 `javis_mission.gate()` 다(사본 금지).
+    모듈이 없으면 **fail-closed**: 임무 없음으로 접는다(팩 스큐가 자율주행을 열지 않는다).
+
+    ★R4 탐지 가능성(2026-08-02): verdict 의 `anomalies` 를 **판정과 무관하게 항상** stderr 로
+      흘린다. 동일 UID 의 원장 삭제·절단·창 축소 시도는 원리적으로 차단할 수 없으므로
+      (보장 범위 SOT: docs/THREAT-MODEL-mission-gate.md), 남은 무기는 흔적이 master 눈에
+      **반드시 닿는 것**이다. master 가 실제로 게이트를 보는 지점이 여기(next-action·gate-status)
+      이므로 `javis_mission status` 에만 찍고 끝내면 아무도 안 본다. 은폐는 규약 위반이다.
+    """
+    try:
+        import javis_mission as _m
+        rc, v = _m.gate()
+    except Exception as e:
+        return 2, {"have_mission": False, "mission": None,
+                   "reason": "javis_mission 미적재(%s) — fail-closed" % e}
+    for _a in (v.get("anomalies") or []):
+        print("[mission] ★이상징후(%s): %s — 오너에게 보고하라(은폐 금지)"
+              % (_a.get("code"), _a.get("detail")), file=sys.stderr)
+    return rc, v
 
 
 def cmd_next_action(args):
-    # exit 계약: 0=다음 액션 있음(stdout) / 1=빈 큐(전 작업 완료 — 정지·오너 보고) /
-    # 2=SESSION_STATE 부재(신규 시작 — 오너 지시 대기). 1과 2는 다른 대응이다(§0-⑥ vs §14).
+    # ★exit 계약 v2 (2026-08-01 윈도우 실사고 T1 — 임무 게이트 신설):
+    #   0 = 다음 액션 있음 **그리고** 이 세션에 오너 임무 지정이 있다 → 자율 착수 가
+    #   1 = 빈 큐(전 작업 완료 — 정지·오너 보고)
+    #   2 = SESSION_STATE 부재(신규 시작 — 오너 지시를 기다린다)
+    #   3 = 큐에 항목은 있으나 **임무 미지정** → 자율 착수 금지. "대기 중인 작업 N건이 있습니다.
+    #       이어서 하시겠습니까?"로 **보고하고 멈춘다**.
+    # 왜 3이 필요한가: 구 계약은 exit 0(항목 있음)만 보고 달렸다. 그런데 큐는 master 자신이 쓴
+    # SESSION_STATE 다 — 산출자가 자기 산출물로 착수 권한을 발급하는 자기인가였다. 오너가 임무를
+    # 주지 않은 부팅에서 **이전 세션 잔무 큐**를 집어 무한 작업에 들어간 실사고의 직접 원인이다.
+    # 이전 세션 잔무는 **보고 대상**이지 자동 착수 대상이 아니다.
     p = os.path.join(pack_dir(), "round", "SESSION_STATE.md")
     try:
         text = open(p, encoding="utf-8", errors="replace").read()
@@ -1231,11 +1909,28 @@ def cmd_next_action(args):
         print("[next-action] SESSION_STATE 없음(신규 시작): %s — 오너 지시를 기다려라."
               % p, file=sys.stderr)
         return 2
-    item = extract_next_action(text)
+    items = next_action_items(text)
+    item = items[0] if items else None
     if item is None:
         print("[next-action] 다음 액션 큐 비어 있음 — 전 작업 완료. 자율 루프 정지·오너 보고.",
               file=sys.stderr)
         return 1
+    mrc, mv = _mission_gate()
+    if mrc != 0:                                  # 1=임무 없음 · 2=판독 불가(둘 다 착수 금지)
+        n = len(items)
+        # stdout 은 **오너에게 그대로 읽어줄 보고 문안**이다(master가 문장을 지어내지 않게).
+        print("대기 중인 작업 %d건이 있습니다. 이어서 하시겠습니까? (첫 항목: %s)" % (n, item))
+        print("[next-action] 임무 미지정 — 자율 착수 금지(exit 3). 사유: %s"
+              % mv.get("reason"), file=sys.stderr)
+        # ★적발 (b) 수리(2026-08-01 R2): 이 안내문의 유일한 독자는 **방금 차단당한 master 본인**
+        #   이다. 여기에 `javis_mission.py set` 을 적어 두면 게이트가 자기 우회법을 가르치는 것이
+        #   된다(그 명령은 이제 `cys feed push --wait` 오너 승인에 결박됐지만, 안내 자체를 두면
+        #   "일단 쳐 보라"는 유인이 남는다). 해제 경로는 **오너 채널 하나**로만 안내한다.
+        print("  이 큐는 이전 세션의 잔무다. **보고 대상이지 자동 착수 대상이 아니다.**\n"
+              "  지금 할 일: 위 stdout 한 줄을 오너에게 그대로 보고하고 **멈춘다**.\n"
+              "  해제는 오너가 이 세션에 임무를 말할 때만 일어난다(UserPromptSubmit 훅이 자동 기록).",
+              file=sys.stderr)
+        return 3
     print(item)
     return 0
 
@@ -1393,7 +2088,9 @@ def cmd_self_test(args):
         with contextlib.redirect_stdout(buf):
             cmd_review_prompt(_A())
         out = buf.getvalue()
-        for must in ("엄격 제약", "배회 금지", "문제점", "회신", "+10%"):
+        # ★전환 게이트 §9-7-2: 고정 향상률 리터럴의 "존재 필수" 검사를 새 기준으로 교체.
+        for must in ("엄격 제약", "배회 금지", "문제점", "회신",
+                     "잠근 합격 기준의 미달 항목 0"):
             assert must in out, "review-prompt에 '%s' 누락" % must
         # T1(attention-p0) 밀폐 검증: 기각 재주입·불변식 — env 격리·복원(preflight C19 호출 안전)
         import tempfile as _tf
@@ -1455,12 +2152,30 @@ def cmd_self_test(args):
         assert _cell("a|b\nc") == "a/b c", "_cell 새니타이즈 오류"
         # task-prompt 티켓(밀폐 — rules 명시 주입, 설치본 디렉티브 상태와 무관):
         # 절대 강조 4규칙·게이트·todo(pack 앵커)·보고 채널이 항상 포함된다
+        # ★W14 S14 — 종전 필수 토큰 `"${CYS_PACK_DIR"`는 **뺐다**. todo 경로를 워커 셸에서 늦게
+        #   전개되는 문자열로 두는 것이 바로 이번에 없앤 이원 바인딩이다(경로=워커 시점 /
+        #   선언 scope=master 시점 → foreign-scope 오배제 → false QUIET). pack 앵커 보장은
+        #   아래 S14 블록이 **발부 시점 절대경로**(`_pack_identity()` + WORKER_TODO.md)로
+        #   더 강하게 핀한다 — 토큰 존재 검사는 그 불변식과 정면으로 모순된다.
         ticket = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES)
         for must in ("절대 강조 4규칙", "품질 절대우선", "할루시네이션 방지",
                      "hallucination-guard", "grill-me", "요약·압축 절대 금지", "게이트",
-                     "성공 기준", "WORKER_TODO.md", "${CYS_PACK_DIR", "보고 채널",
-                     "--queued"):
+                     "성공 기준", "WORKER_TODO.md", "보고 채널",
+                     "--queued", "완료 증거(E1 evidence-artifact 게이트", "--evidence-artifact",
+                     "done 증거 게이트(P3)"):
             assert must in ticket, "task-prompt 티켓에 '%s' 누락" % must
+        # P3 필수 probe 블록: probes 미지정이면 부재(하위호환·E1 블록은 그대로), 지정 시 목록·actprobe 명령
+        assert "필수 probe" not in ticket, "probes 미지정인데 필수 probe 블록 존재(하위호환 위반)"
+        tp_probe = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES,
+                                     probes=["submit", "artifact"])
+        assert "필수 probe" in tp_probe and "submit, artifact" in tp_probe \
+            and "javis_actprobe.py" in tp_probe, "probes 지정인데 필수 probe 블록 누락"
+        # ★--task 동반(R1 major-a) + relaxed 경고(무-task 영수증 거부 회귀 배선)
+        assert "--task <task-id>" in tp_probe, "probe 예시에 '--task <task-id>' 동반 누락(무-task 영수증 거부 회귀)"
+        assert "relaxed probe" in tp_probe, "relaxed probe --task 경고 누락"
+        # E1·P3 공존: probes 지정 시에도 E1 블록이 함께 존재(둘 다 명시)
+        assert "완료 증거(E1 evidence-artifact 게이트" in tp_probe and "done 증거 게이트(P3)" in tp_probe, \
+            "E1·P3 evidence 게이트 공존 실패"
         # 폴백 단독으로도 4규칙 마커 전부를 갖는다(디렉티브 부재 환경의 최후 방어선)
         fb = "\n".join(FALLBACK_RULES)
         for mark in RULE_MARKERS:
@@ -1472,6 +2187,40 @@ def cmd_self_test(args):
         # todo 파일명은 역할명 대문자 변환(reviewer-gemini → REVIEWER_GEMINI_TODO.md)
         assert "REVIEWER_GEMINI_TODO.md" in build_task_ticket(
             "T", "S", None, "reviewer-gemini", rules=FALLBACK_RULES), "todo 파일명 역할 변환 오류"
+        # ★todo 선언 v1(설계 §4-1) — 티켓이 문법 위반 선언을 배포하면 파서가 전건 미선언으로
+        # 버려 배선 자체가 무의미해진다. 문법을 여기서 기계로 못박는다(손기재 오류 원천 차단).
+        decl, why = todo_decl_line("reviewer-gemini", "유령 todo 결함 수정 (ghost fix)")
+        assert decl is not None, "선언 생성 실패: %s" % why
+        m_decl = re.fullmatch(r"<!-- javis:todo (v\d+) (.+) -->", decl)
+        assert m_decl and m_decl.group(1) == "v1", "선언 접두·버전 토큰 형식 오류: %r" % decl
+        toks = dict(t.split("=", 1) for t in m_decl.group(2).split())
+        for k in ("owner", "scope", "status"):                      # G5 필수 키 3종
+            assert k in toks, "선언 필수 키 '%s' 누락: %r" % (k, decl)
+        for k, v in toks.items():                                   # G4 키·값 문법
+            assert re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", k), "선언 키 문법 위반: %r" % k
+            assert re.fullmatch(r"[A-Za-z0-9._:-]+", v), "선언 값 문법 위반: %s=%r" % (k, v)
+        assert toks["owner"] == "reviewer-gemini" and toks["status"] == "active", decl
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", toks.get("since", "")), "since 날짜 형식 오류: %r" % decl
+        # lane은 한글·공백을 지운 슬러그(G4 위반 방지) — 남는 게 없으면 키 자체를 생략한다
+        assert toks.get("lane") == "todo-ghost-fix", "lane 슬러그 정규화 오류: %r" % decl
+        assert "lane=" not in todo_decl_line("worker", "유령 결함")[0], \
+            "슬러그가 빈 lane을 빈 값으로 배출(선언 전체 무효화 위험)"
+        # ★W14 S14 — 정체성 값은 **접지 않는다**. 팩 이름이 G4 밖이면 그럴듯한 폴백을
+        # 만들지 말고 시끄럽게 실패해야 한다(스탬프 도구와 같은 정책으로 수렴).
+        bad_line, bad_why = todo_decl_line("worker", "t", scope="자비스")
+        assert bad_line is None and bad_why, "G4 밖 scope를 조용히 접어 배포했다"
+        assert todo_decl_line("워커", "t", scope="pack")[0] is None, "G4 밖 owner를 접어 배포했다"
+        # 경로와 scope는 **같은 바인딩**에서 나온다 — 티켓의 todo 경로는 발부 시점 절대경로다.
+        _pk_root, _pk_scope = _pack_identity()
+        _tk = build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES)
+        assert os.path.join(_pk_root, "round", "WORKER_TODO.md") in _tk, \
+            "티켓 todo 경로가 발부 시점 절대경로가 아니다(늦은 전개 = scope 이원 바인딩)"
+        assert "scope=%s" % _pk_scope in _tk, "티켓 선언 scope가 발부 시점 팩과 다르다"
+        assert "${CYS_PACK_DIR" not in _tk.split("todo 영속:")[1].split("\n")[0], \
+            "todo 경로가 여전히 워커 셸에서 늦게 전개된다(S14 재발)"
+        # 티켓 동봉 확인은 날짜 리터럴을 비교하지 않는다(자정 경계에서 since가 갈리는 위조 flake 방지)
+        assert "<!-- javis:todo v1 owner=worker scope=" in build_task_ticket(
+            "T", "S", None, "worker", rules=FALLBACK_RULES), "티켓에 todo 선언 한 줄 누락"
         # 추출기(순수 함수) 배터리 — 합성 디렉티브 텍스트로 밀폐 검증:
         synth = ("# W\n\n## 7. ★절대 강조 4규칙 — x\n머리말.\n"
                  + "\n".join(FALLBACK_RULES) + "\n\n## 8. 다음\n- 무관\n")
@@ -1551,6 +2300,27 @@ def cmd_self_test(args):
         # ★'없음' 시작-매칭 과확장 차단(6차 R2): "없음 처리 로직" 같은 실제 과제는 빈 칸 아님
         assert extract_next_action("# S\n## 다음 액션 큐\n1. 없음 처리 로직 구현\n") \
             == "없음 처리 로직 구현", "'없음'으로 시작하는 실제 과제가 silent skip"
+        # ★T1(2026-08-01) 회귀 핀 — **예약 블록은 큐가 아니다**.
+        #   구 코드는 섹션 경계가 `## ` 뿐이라, 팩 기본 템플릿의
+        #   `<!-- CYS:RESERVED:restore_pointer -->` / `- 복원 포인터: (없음)` 을 큐 항목으로 읽었다.
+        #   실효: 큐가 `1. (없음)`(갓 설치·전 작업 완료)인데도 exit 0(자율 착수 가)이 났다 —
+        #   **한 번도 쓰지 않은 SESSION_STATE 로 자율주행이 시동**되는 경로였다.
+        ss_res = ("# S\n## 다음 액션 큐\n1. (없음)\n\n"
+                  "<!-- CYS:RESERVED:restore_pointer __CYS__RESERVED__ -->\n"
+                  "- 복원 포인터: (없음)\n"
+                  "<!-- /CYS:RESERVED:restore_pointer -->\n")
+        assert extract_next_action(ss_res) is None, \
+            "예약 블록(복원 포인터)이 다음 액션으로 반환 — 빈 큐가 자율 착수로 오판(T1 회귀)"
+        # 팩 동봉 템플릿 실물로도 확인한다(문서와 코드가 같이 늙지 않게 · 부재 시 건너뜀)
+        _tpl = os.path.join(pack_dir(), "round", "SESSION_STATE.md")
+        if os.path.isfile(_tpl):
+            _t = open(_tpl, encoding="utf-8", errors="replace").read()
+            if "1. (없음)" in _t:
+                assert extract_next_action(_t) is None, \
+                    "팩 기본 SESSION_STATE 템플릿이 빈 큐인데 액션을 반환한다(T1 회귀)"
+        # 계수는 추출과 **같은 필터**를 쓴다(보고 숫자와 착수 판정이 갈리지 않게)
+        assert len(next_action_items(ss2)) == 2, "미완 항목 계수 불일치"
+        assert len(next_action_items(ss4)) == 1, "완료([x]) 항목이 계수에 포함"
         # (e) 핀↔마커 패리티: 마커 소실로 폴백 강등될 때 안내하는 preflight C03(WORKER 핀)이
         # 같은 소실을 검출할 수 있어야 진단 루프가 닫힌다. javis_preflight가 같은 bin에
         # 있을 때만 검사(없는 환경에서는 자기 검증 불가 — 건너뜀).
@@ -1565,7 +2335,7 @@ def cmd_self_test(args):
             for mark in RULE_MARKERS:
                 assert any(mark in pin or pin in mark for pin in worker_pins), \
                     "마커 '%s'가 WORKER C03 핀에 비커버 — 폴백 강등 원인을 preflight가 못 본다" % mark
-        # ── 리뷰어 감지·무구독 폴백 배터리(오너 2026-06-14 · 밀폐 가짜 감지기) ──
+        # ── 리뷰어 감지·무구독 폴백 배터리(2026-06-14 · 밀폐 가짜 감지기) ──
         # 표준 슬롯 계약 고정: agy/codex 네이티브 + claude 대체 2슬롯(변형 시 폴백 붕괴).
         assert [s[1] for s in REVIEWER_SLOTS] == ["gemini", "codex"], "표준 리뷰어 슬롯 변형"
         assert [s[3] for s in REVIEWER_SLOTS] == ["claude", "claude"], "대체 agent 는 claude 여야 함"
@@ -1595,6 +2365,19 @@ def cmd_self_test(args):
             ["cso", "worker", "reviewer-claude-1", "reviewer-claude-2"], "유효 의무역할 치환 오류"
         assert effective_required_roles(detect=yes, agents=synth_ag) == REQUIRED_ROLES, \
             "감지 시 유효 의무역할이 표준과 불일치"
+
+        # ── B18: 팀 구성 안내 파생(H-DOC-2) — 리터럴 금지·master 는 required 밖 ──
+        assert "master" not in REQUIRED_ROLES, \
+            "REQUIRED_ROLES 에 master 가 들어갔다(금지 방향 ② — 레거시 master 부트 사망)"
+        _note = team_roster_note()
+        assert _note.startswith("master·"), "팀 구성 안내가 master 로 시작하지 않는다"
+        assert "총 %d노드" % (len(REQUIRED_ROLES) + 1) in _note, \
+            "노드 수가 REQUIRED_ROLES+1 파생이 아니다: %s" % _note
+        for _r in REQUIRED_ROLES:
+            assert _r in _note, "필수 역할 %s 가 안내에서 누락" % _r
+        # 편성이 바뀌면 숫자·역할명이 **따라 움직인다**(사본 드리프트 불가능성 증명)
+        _n3 = team_roster_note(required=["cso", "worker"])
+        assert "총 3노드" in _n3 and "reviewer" not in _n3, "안내가 편성 변화를 따르지 않는다: %s" % _n3
 
         # ── 무음실패 카탈로그 배터리 (OpenMontage D5 2부 — render·무점수·드리프트) ──
         sf_ids = [s["id"] for s in SILENT_FAILURES]
@@ -1725,10 +2508,77 @@ def cmd_self_test(args):
         assert guard_master_verdict("31", []) == (0, "no_master"), "master 부재인데 PASS 아님"
         assert guard_master_verdict("31", None) == (0, "list_fail"), "cys list 실패인데 PASS/list_fail 아님(부팅 차단 회귀)"
         assert guard_master_verdict("notanumber", [99]) == (0, "unparsed"), "파싱불가 env가 false-block(회귀)"
+
+        # ─────────── W2: B1 PLAN 정책 열 · B2 slot_satisfied · check_verdicts · A12 분류 ───────────
+        # B1: 정책이 편성과 같은 행에 있고, Fatal 집합 = cso·worker(조직 최소 실행 단위)뿐이다.
+        assert [r for r, _a, _p in BOOT_PLAN] == \
+            ["cso", "worker", "reviewer-gemini", "reviewer-codex", "reviewer-grok"], \
+            "BOOT_PLAN 편성 변형(cys boot PLAN 과 파리티 깨짐)"
+        assert plan_mandatory_roles() == ["cso", "worker"], \
+            "Fatal 집합 변형 — 리뷰어가 Fatal 이면 리뷰어 1종 고장이 팀 전체 부트를 죽인다(B1 재발)"
+        assert plan_policy("reviewer-gemini") == FAIL_DEGRADE, "네이티브 리뷰어가 Degrade 아님"
+        assert plan_policy("reviewer-grok") == FAIL_DEGRADE, "선택 리뷰어가 Degrade 아님"
+        assert plan_policy("cso") == FAIL_FATAL and plan_policy("worker") == FAIL_FATAL, \
+            "cso·worker 가 Fatal 아님(조직 최소 실행 단위 붕괴)"
+        assert plan_policy("verifier") == FAIL_DEGRADE, "미지 role 이 Fatal 로 접힘(부트 사망 회귀)"
+        # PLAN 정책 열 ↔ effective_required_roles ↔ 결손 구성 3자 대조(H-PRED-7):
+        #   Fatal 역할은 전부 유효 의무 목록에 있어야 하고, 유효 의무 리뷰어는 슬롯으로 해소돼야 한다.
+        _yes = lambda ag, agents=None: (True, "테스트 주입")   # noqa: E731
+        _synth = {"gemini": {"cmd": "/x/agy"}, "codex": {"cmd": "/x/codex"}, "claude": {"cmd": "claude"}}
+        _eff = effective_required_roles(detect=_yes, agents=_synth)
+        assert set(plan_mandatory_roles()) <= set(_eff), \
+            "Fatal 역할이 유효 의무 목록에서 빠짐(부트는 요구하는데 check 는 안 봄)"
+        assert all(r in [p[0] for p in BOOT_PLAN] or r.startswith("reviewer-claude")
+                   for r in _eff), "유효 의무 역할이 PLAN 에도 슬롯에도 없음(고아 요건)"
+        # B2 slot_satisfied — 네이티브·대체·부재 3케이스 + 실충전자 라벨
+        s_ok, s_fill, s_nat, _ = slot_satisfied("reviewer-gemini", {"reviewer-gemini"})
+        assert (s_ok, s_fill, s_nat) == (True, "reviewer-gemini", True), "네이티브 좌석 충족 실패"
+        s_ok, s_fill, s_nat, _ = slot_satisfied("reviewer-gemini", {"reviewer-claude-1"})
+        assert (s_ok, s_fill, s_nat) == (True, "reviewer-claude-1", False), \
+            "2차 폴백 대체 좌석이 슬롯을 충족하지 못함(B2 영구 적색 재발)"
+        s_ok, s_fill, _, _ = slot_satisfied("reviewer-codex", {"reviewer-claude-1"})
+        assert s_ok is False and s_fill is None, "슬롯 교차 충전(codex 슬롯을 gemini 대체가 채움)"
+        assert slot_satisfied("cso", {"cso-1"})[0] is False, "cso-1 이 의무 cso 를 충족(G26 재발)"
+        assert slot_satisfied("worker", {"worker-2"})[0] is True, "worker-N dedup 좌석 수용 실패"
+        assert slot_satisfied("reviewer-gemini", {"reviewer-grok"})[0] is False, \
+            "선택 리뷰어(grok)가 의무 슬롯을 충족(G26 재발)"
+        # check_verdicts — B6 강등 라벨링(agent_alive 단독=생존추정)·좌석 empty=미충족
+        def _st(rows):
+            return {"surfaces": rows}
+        _base = [{"role": "cso", "exited": False, "awakened_at": 1.0},
+                 {"role": "worker-2", "exited": False, "status": {"age_secs": 3, "state": "working"}},
+                 {"role": "reviewer-gemini", "exited": False, "agent_alive": True},
+                 {"role": "reviewer-codex", "exited": False, "seat": "empty", "agent_alive": False}]
+        _v, _ = check_verdicts(_st(_base))
+        assert _v["cso"]["grade"] == "awake_confirmed", "래치 좌석이 각성확정 아님"
+        assert _v["worker"]["satisfied"] and _v["worker"]["filler"] == "worker-2", \
+            "worker-2 dedup 좌석이 worker 요건을 못 채움"
+        assert _v["reviewer-gemini"]["grade"] == "alive_presumed", \
+            "agent_alive 단독이 각성확정으로 계상(B6 오답 잔존)"
+        assert _v["reviewer-gemini"]["satisfied"] is True, \
+            "생존추정 강등이 **실패로 승격**됐다(래치 이전 기계 전원 적색 — 역방향 회귀)"
+        assert _v["reviewer-codex"]["satisfied"] is False, "좌석 empty·무신호인데 충족으로 계상"
+        # 대체 좌석만 있는 상태 → 슬롯 재해소로 충족(B2)
+        _sub = [{"role": "cso", "exited": False, "awakened_at": 1.0},
+                {"role": "worker", "exited": False, "awakened_at": 1.0},
+                {"role": "reviewer-gemini", "exited": False, "awakened_at": 1.0},
+                {"role": "reviewer-claude-2", "exited": False, "awakened_at": 1.0}]
+        _v2, _ = check_verdicts(_st(_sub))
+        assert _v2["reviewer-codex"]["satisfied"] is True, "대체 좌석 재해소 실패(B2)"
+        assert _v2["reviewer-codex"]["native"] is False, "실충전자 라벨(native=False) 누락"
+        # A12 exit 분류
+        assert classify_call_exit(0)[0] == EXIT_CLASS_OK, "rc0 이 ok 아님"
+        assert classify_call_exit(2)[0] == EXIT_CLASS_PERMANENT, "exit 2 가 영구 실패 아님"
+        assert classify_call_exit(127)[0] == EXIT_CLASS_PERMANENT, "exit 127 이 영구 실패 아님"
+        assert classify_call_exit(124)[0] == EXIT_CLASS_TRANSIENT, "exit 124 가 재시도 대상 아님"
+        assert classify_call_exit(1)[0] == EXIT_CLASS_TRANSIENT, "exit 1 이 재시도 대상 아님(보수 이탈)"
+        assert "재시도는 무의미" in classify_call_exit(127)[1], "영구 실패에 재시도 금지 처방 누락"
+        assert _boot_node_outer_timeout() >= 100, "boot_node 외부 상한이 비정상(예산 파생 실패)"
     except AssertionError as e:
         print("javis_orchestra self-test FAIL: %s" % e, file=sys.stderr)
         return 1
-    print("javis_orchestra self-test OK (4종 노드·라운드 상한·경로 탈출방지·제약 주입·"
+    print("javis_orchestra self-test OK (W2: PLAN 정책열·slot_satisfied 3케이스·check_verdicts "
+          "강등라벨·A12 exit 분류 + 4종 노드·라운드 상한·경로 탈출방지·제약 주입·"
           "4규칙 티켓 주입·do/don't 무접촉·파싱·셀 새니타이즈·무음실패 카탈로그·전제지식 주입·매니페스트 배선)")
     return 0
 
@@ -1737,6 +2587,11 @@ def main():
     # preflight 호환: `--self-test`는 subcommand 없이도 동작해야 한다(가로채기).
     if "--self-test" in sys.argv:
         return cmd_self_test(None)
+    # ★B18(H-DOC-2): 훅 note·문서가 인용할 팀 구성 1줄. subcommand 공간을 늘리지 않고
+    #   `--self-test` 와 동일한 가로채기 관례를 쓴다(javis_budget --note-check-window 대칭).
+    if "--note-team-roster" in sys.argv:
+        print(team_roster_note())
+        return 0
     ap = argparse.ArgumentParser(description="LLM 오케스트레이션 결정론 도구(앵커4)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -1783,6 +2638,10 @@ def main():
     tp.add_argument("--tier", default=None,
                     help="권장 실행 등급 정보 1줄 주입(trivial/standard/heavy — 강제 아님·R2 1단계·"
                          "javis_route suggested_node와 정합). 미지정 시 티켓 byte-동일")
+    tp.add_argument("--probes", default=None,
+                    help="이 태스크의 필수 probe 목록(쉼표 구분 — 예: 'submit,artifact'). 지정 시 "
+                         "티켓에 done 전 각 probe PASS 영수증 필수 블록 삽입(P3 · 설계 §2.2·§4 컴포넌트 C·"
+                         "javis_actprobe.py 대조). 미지정 시 블록 부재 → 티켓 byte-동일(하위호환)")
     tp.add_argument("--no-survival-gate", action="store_true",
                     help="생존 게이트 생략(D5 일회용 fresh 경로 — 워커 surface가 실행 시점에 생성될 때만). "
                          "평시 위임엔 쓰지 마라(상시 워커 생존 확인이 안전).")
@@ -1805,7 +2664,7 @@ def main():
     ri = sub.add_parser("round-init"); ri.add_argument("--task", required=True)
     rl = sub.add_parser("round-log")
     rl.add_argument("--task", required=True); rl.add_argument("--round", type=int, required=True)
-    rl.add_argument("--evaluator", required=True); rl.add_argument("--score", default="-")
+    rl.add_argument("--evaluator", required=True)   # --score 제거: §6-4 점수 금지 · §9-7-2 부수 1
     rl.add_argument("--verdict", default="")
     rl.add_argument("--from-cmd", dest="from_cmd", default=None,
                     help="기계검증 명령을 직접 실행해 exit code로 verdict 자동 기록"

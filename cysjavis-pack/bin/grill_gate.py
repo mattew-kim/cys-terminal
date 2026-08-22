@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """grill_gate.py — grill-me 최소 질문(결정론 floor) 게이트 엔진.
 
-목적(오너 요구 2026-06-27): grill-me 사용 시 "서로 다른 결정 브랜치"를 최소 20개
+목적(제품 기본 절차): grill-me 사용 시 "서로 다른 결정 브랜치"를 최소 20개
 (아주 복잡한 작업은 30개) 해소하기 전에는 합의 결과물 쓰기(구현)로 넘어가지 못하게
 '강제'한다. 순수 프롬프트 지시는 권고일 뿐이라(producer=evaluator 단일체) 결정론
 게이트가 필요하다.
@@ -31,6 +31,20 @@
 
 ★fail-open 원칙(threat model = 비악의 오작동 방지, 적대 봉쇄 아님):
   마커 부재·TTL 만료·status=passed/done/abandoned·파싱 실패·판단 불가 → 전부 통과측.
+
+★B2 self-cap(Phase 1 Wave B2 · DESIGN-DECISIONS §3 · D2): grill 과 completion-guard 는
+  하네스 Stop 블록 카운터(합산 지갑·cap 기본 8)를 공유한다 — grill 블록이 지갑을 선점하면
+  guard 의 escalation(N=3) 도달 전 무검증 오버라이드가 가능(T0 §2 실험 4·K≥5 산술).
+  self-cap 은 grill 자신의 블록 예산에 상한을 둔다:
+    발동 조건 = env CYS_COMPLETION_GUARD=1 인 pane **한정** + GRILL_STOP_SELF_CAP ≥1
+    (기본 0 = **비활성** — 현행 동작 무변. guard 미무장 함대엔 부수효과 0).
+    카운터 = 마커(grill 사이클) 귀속 필드 stop_self_blocks — 새 사이클(새 마커) = 리셋.
+    소진 시 check 는 차단 대신 **자진 통과(exit 0)** 하고 마커 self_cap_yields 에 사유를
+    기록한다(FLOOR 미충족 감사 가시화 — 통과가 충족 위장이 되지 않게 status 는 불변).
+    grill-stop.sh·grill-gate.sh 는 무변경(구현 소재 = 이 엔진 · 조건 24③ 훅 개정 회피) —
+    두 훅이 같은 check 를 부르므로 카운터는 Stop·PreToolUse 블록을 구분 없이 계상한다
+    (자인: PreToolUse deny 는 하네스 Stop 지갑을 쓰지 않지만, 무장 pane 의 총 블록 압력
+    상한이라는 보수측 해석으로 수용 — 정밀 분리는 훅 개정 없이는 불가).
 """
 import argparse
 import hashlib
@@ -213,8 +227,12 @@ def decide_floor(request_text):
     return floor, signals
 
 
-def cmd_begin(request_text):
+def cmd_begin(request_text, floor_override=0):
     floor, signals = decide_floor(request_text)
+    # ★--floor 상향 전용 오버라이드(v2): 오너/티켓의 "복잡" 선언 반영. 하향은 구조적 불가.
+    if floor_override and _int(floor_override, 0) > floor:
+        floor = _int(floor_override, 0)
+        signals = signals + ["owner-floor:%d" % floor]
     has_override = bool(os.environ.get("GRILL_MARKER", "").strip())
     sid = _surface_id()
     # ★격리 불가 시 fail-open: 마커를 만들지 않아 cross-node 마비를 원천 차단.
@@ -223,6 +241,23 @@ def cmd_begin(request_text):
                           "reason": "CYS_SURFACE_ID 부재 — surface 격리 불가, "
                                     "cross-node 마비 방지 위해 미발동(fail-open)",
                           "floor": floor, "signals": signals}, ensure_ascii=False))
+        return 0
+    # ★v2 상향 시맨틱: collecting(미만료) 마커가 있으면 덮어쓰기 금지 — floor 상향만 병합.
+    #   axes·raw_count는 어떤 경로로도 리셋되지 않는다(자동무장 후 모델의 원문 begin이
+    #   복잡도를 30으로 정밀 교정하는 경로를 열되, 진행 소실·하향 게이밍은 봉쇄).
+    old = _load_marker()
+    if old and old.get("status") == "collecting" and not _expired(old):
+        old_floor = _int(old.get("floor"), DEFAULT_FLOOR_SIMPLE)
+        merged = max(old_floor, floor)
+        if merged != old_floor:
+            old["floor"] = merged
+            old["complexity"] = ("complex" if merged >= DEFAULT_FLOOR_COMPLEX
+                                 else "simple")
+            old["complexity_signals"] = list(old.get("complexity_signals") or []) + signals
+            _save_marker(old)
+        print(json.dumps({"session_id": old.get("session_id"), "merged": True,
+                          "floor": merged, "distinct": len(old.get("axes", [])),
+                          "signals": signals}, ensure_ascii=False))
         return 0
     m = {
         "session_id": _axis_hash(str(time.time()) + (request_text or "")),
@@ -326,10 +361,55 @@ def evaluate(m):
     return False, "grill floor satisfied (%d/%d)" % (distinct, floor), distinct, floor
 
 
+def _self_cap():
+    """B2(D2): grill 자기 블록 예산 상한 — CYS_COMPLETION_GUARD=1 pane 한정·기본 0(off).
+    반환 cap(int ≥0) · 0 = 비활성(현행 동작 무변)."""
+    if os.environ.get("CYS_COMPLETION_GUARD") != "1":
+        return 0
+    return max(0, _int(os.environ.get("GRILL_STOP_SELF_CAP"), 0))
+
+
 def cmd_check():
     m = _load_marker()
     blocked, reason, distinct, floor = evaluate(m)
     if blocked:
+        # ── B2 self-cap: 무장 pane 에서 자기 블록 예산 소진 시 자진 통과(+마커 사유 기록).
+        #    카운터는 이 마커(사이클) 귀속 — 새 사이클(새 마커)은 0에서 시작(리셋). ──
+        cap = _self_cap()
+        if cap:
+            used = _int(m.get("stop_self_blocks"), 0)
+            if used >= cap:
+                # G7a: 코얼레싱 — 첫 자진 통과만 행 기록, 이후는 count 증가(반복 Stop 이
+                # 마커를 행으로 비대화·중복 감사 행 생성하는 것 방지). 비-list 손상은 새
+                # 리스트 치환 가드(파싱 불가 잔재가 기록 자체를 죽이지 않게 — fail-soft).
+                yields = m.get("self_cap_yields")
+                if not isinstance(yields, list):
+                    yields = []
+                    m["self_cap_yields"] = yields
+                if yields and isinstance(yields[-1], dict):
+                    yields[-1]["count"] = _int(yields[-1].get("count"), 1) + 1
+                    yields[-1]["last_at"] = time.time()
+                else:
+                    yields.append(
+                        {"at": time.time(), "cap": cap, "blocks": used, "count": 1,
+                         "reason": "self-cap 소진 자진 통과 — floor 미충족(%d/%d) 잔존"
+                                   "(FLOOR 감사 대상 · 하네스 Stop 지갑 보존 D2 · 자인: "
+                                   "grill-gate.sh 공유로 PreToolUse 쓰기 게이트 동반 개방)"
+                                   % (distinct, floor)})
+                try:
+                    _save_marker(m)
+                except OSError:
+                    pass  # 기록 실패도 통과측(fail-open) — 지갑 보존이 우선
+                sys.stderr.write(
+                    "grill-gate self-cap: 자기 블록 예산 소진(%d/%d) — 자진 통과(exit 0). "
+                    "floor 미충족(%d/%d)은 마커 self_cap_yields 에 감사 기록됨.\n"
+                    % (used, cap, distinct, floor))
+                return 0
+            m["stop_self_blocks"] = used + 1
+            try:
+                _save_marker(m)
+            except OSError:
+                pass  # 계상 실패는 차단 자체를 막지 않는다(보수측 — 블록은 유지)
         sys.stderr.write("grill-gate BLOCKED: %s\n" % reason)
         return 2
     if m and m.get("status") == "collecting" and floor > 0 and distinct >= floor:
@@ -388,6 +468,9 @@ def self_test():
     fails = []
     td = tempfile.mkdtemp(prefix="grill-gate-test-")
     os.environ["GRILL_MARKER"] = os.path.join(td, ".grill_session.json")
+    # B2 self-cap 밀폐: ambient 무장 env 가 기존 케이스의 차단 산술을 오염시키지 않게 핀.
+    os.environ.pop("CYS_COMPLETION_GUARD", None)
+    os.environ.pop("GRILL_STOP_SELF_CAP", None)
 
     def fresh(floor):
         _save_marker({"session_id": "t", "floor": floor, "status": "collecting",
@@ -537,6 +620,87 @@ def self_test():
         if f5 != 20:
             fails.append("⑭b COMPLEX 오탐: 'migration' 단독이 floor %d(20 기대)" % f5)
 
+        # ⑯ ★v2 begin 상향 시맨틱: collecting 마커에 재begin — 진행 보존·상향만
+        fresh(20)
+        _save_marker(dict(_load_marker(), axes=["a1", "a2"], raw_count=2))
+        cmd_begin("멀티 서브시스템 아키텍처 재설계 전수조사")   # 복잡 → 30 상향
+        m16 = _load_marker()
+        if _int(m16.get("floor"), 0) != 30:
+            fails.append("⑯재begin 상향 실패 floor=%s(30 기대)" % m16.get("floor"))
+        if len(m16.get("axes", [])) != 2 or m16.get("raw_count") != 2:
+            fails.append("⑯재begin이 진행(axes/raw)을 리셋함")
+        cmd_begin("오타 수정")   # 단순 → 하향 시도: 30 유지되어야
+        if _int(_load_marker().get("floor"), 0) != 30:
+            fails.append("⑯하향 게이밍 차단 실패(30→%s)" % _load_marker().get("floor"))
+        # ⑯b --floor 상향 전용 오버라이드
+        fresh(20)
+        cmd_begin("간단 작업", floor_override=30)
+        if _int(_load_marker().get("floor"), 0) != 30:
+            fails.append("⑯b --floor 상향 미반영")
+        fresh(30)
+        cmd_begin("간단 작업", floor_override=20)   # 하향 시도
+        if _int(_load_marker().get("floor"), 0) != 30:
+            fails.append("⑯b --floor 하향이 먹힘(게이밍 경로)")
+
+        # ⑰ ★B2 self-cap: 기본(0)=현행 무변 → cap 2 무장 시 3번째 블록 자진 통과+사유 기록
+        #    → 새 사이클(새 마커) 리셋 → 비무장(CYS_COMPLETION_GUARD≠1)은 cap 이 있어도 무변
+        fresh(20)
+        feed(["Auth", "Rollback"])   # distinct 2 < 20 — 차단 상태 조성
+        # (a) 기본 0 = off: 무장돼 있어도 현행 동작 무변(반복 차단·카운터 미계상)
+        os.environ["CYS_COMPLETION_GUARD"] = "1"
+        for _i in range(3):
+            if cmd_check() != 2:
+                fails.append("⑰a cap 기본 0 인데 차단이 풀림(현행 동작 변경)")
+                break
+        if "stop_self_blocks" in (_load_marker() or {}):
+            fails.append("⑰a cap off 인데 카운터가 계상됨")
+        # (b) cap=2: 1·2번째 블록(exit 2) → 3번째 자진 통과(exit 0)+마커 사유 기록·status 불변
+        os.environ["GRILL_STOP_SELF_CAP"] = "2"
+        if cmd_check() != 2 or cmd_check() != 2:
+            fails.append("⑰b cap 2 의 1·2번째가 차단(exit 2) 아님")
+        if cmd_check() != 0:
+            fails.append("⑰b 3번째 블록이 자진 통과(exit 0) 아님")
+        m17 = _load_marker()
+        yields = m17.get("self_cap_yields") or []
+        if len(yields) != 1 or "floor 미충족" not in yields[0].get("reason", ""):
+            fails.append("⑰b 자진 통과 사유 기록 부재/오기록: %s" % yields)
+        if "PreToolUse 쓰기 게이트 동반 개방" not in yields[0].get("reason", ""):
+            fails.append("⑰b G7a 사유 문면에 PreToolUse 동반 개방 자인 누락: %s" % yields)
+        if m17.get("status") != "collecting":
+            fails.append("⑰b 자진 통과가 status 를 변조(충족 위장): %s" % m17.get("status"))
+        if _int(m17.get("stop_self_blocks"), 0) != 2:
+            fails.append("⑰b 카운터 오계상: %s" % m17.get("stop_self_blocks"))
+        # (b2) G7a 코얼레싱: 4·5번째 자진 통과는 행 추가 없이 count 증가(1→3)
+        if cmd_check() != 0 or cmd_check() != 0:
+            fails.append("⑰b2 반복 자진 통과가 exit 0 아님")
+        y2 = (_load_marker() or {}).get("self_cap_yields") or []
+        if len(y2) != 1 or _int(y2[-1].get("count"), 0) != 3:
+            fails.append("⑰b2 코얼레싱 실패(행 %d·count %s — 기대 1행·count 3)"
+                         % (len(y2), y2 and y2[-1].get("count")))
+        # (b3) G7a 비-list 손상 가드: self_cap_yields 가 str 손상이어도 새 리스트 치환·무크래시
+        m_corrupt = _load_marker()
+        m_corrupt["self_cap_yields"] = "corrupt"
+        _save_marker(m_corrupt)
+        if cmd_check() != 0:
+            fails.append("⑰b3 손상 마커에서 자진 통과 실패")
+        y3 = (_load_marker() or {}).get("self_cap_yields")
+        if not isinstance(y3, list) or len(y3) != 1 or _int(y3[-1].get("count"), 0) != 1:
+            fails.append("⑰b3 비-list 손상 치환 가드 실패: %r" % (y3,))
+        # (c) 새 사이클(새 마커) = 리셋: 다시 cap 까지 차단이 살아난다
+        fresh(20)
+        feed(["Auth", "Rollback"])
+        if cmd_check() != 2:
+            fails.append("⑰c 새 사이클에서 카운터 리셋 실패(즉시 통과됨)")
+        # (d) 비무장 pane: cap 이 있어도 무변(한정 발동)
+        os.environ.pop("CYS_COMPLETION_GUARD", None)
+        fresh(20)
+        feed(["Auth", "Rollback"])
+        for _i in range(4):
+            if cmd_check() != 2:
+                fails.append("⑰d 비무장 pane 인데 self-cap 이 발동(한정 위반)")
+                break
+        os.environ.pop("GRILL_STOP_SELF_CAP", None)
+
         # ⑮ ★surface 부재 시 begin fail-open(마커 미생성)
         os.environ.pop("GRILL_MARKER", None)
         os.environ.pop("CYS_SURFACE_ID", None)
@@ -551,15 +715,22 @@ def self_test():
         shutil.rmtree(td, ignore_errors=True)
         os.environ.pop("GRILL_MARKER", None)
         os.environ.pop("CYS_ROOT", None)
+        os.environ.pop("CYS_COMPLETION_GUARD", None)
+        os.environ.pop("GRILL_STOP_SELF_CAP", None)
 
     if fails:
         sys.stderr.write("\n".join(fails) + "\n")
         sys.stderr.write("grill_gate self-test: %d 실패\n" % len(fails))
         return 1
-    print(json.dumps({"self_test": "ok", "cases": 15,
+    print(json.dumps({"self_test": "ok", "cases": 18,
                       "covers": "fail-open·차단·충족·배치우회·쪼개기·무의미·한글축·"
                                 "취소·무응답·end거부/force·done·만료·floor-null·"
-                                "floor20/30/복잡토큰·surface부재"}, ensure_ascii=False))
+                                "floor20/30/복잡토큰·surface부재·"
+                                "v2상향병합/진행보존/하향거부/floor오버라이드·"
+                                "B2 self-cap(기본0 무변·cap2 3번째 자진통과+사유기록·"
+                                "status 불변·새사이클 리셋·비무장 무변·"
+                                "G7a 코얼레싱 count·비-list 손상 치환·PreToolUse 자인 문면)"},
+                     ensure_ascii=False))
     return 0
 
 
@@ -568,6 +739,8 @@ def main():
     ap.add_argument("cmd", nargs="?",
                     choices=["begin", "count", "check", "end", "status"])
     ap.add_argument("--request", default="", help="begin: 원 작업 지시(복잡도 판정용)")
+    ap.add_argument("--floor", type=int, default=0,
+                    help="begin: 상향 전용 floor 오버라이드(오너/티켓 '복잡' 선언 — 하향 불가)")
     ap.add_argument("--force", action="store_true",
                     help="end: 오너 조기중단(미충족이어도 종료·abandoned 기록)")
     ap.add_argument("--self-test", action="store_true")
@@ -576,7 +749,7 @@ def main():
     if args.self_test:
         sys.exit(self_test())
     if args.cmd == "begin":
-        sys.exit(cmd_begin(args.request))
+        sys.exit(cmd_begin(args.request, floor_override=args.floor))
     if args.cmd == "count":
         sys.exit(cmd_count(sys.stdin.read()))
     if args.cmd == "check":

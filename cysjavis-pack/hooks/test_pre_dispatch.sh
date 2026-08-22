@@ -16,6 +16,10 @@
 #
 # 차단 유발 입력은 시뮬레이션 JSON 뿐(실제 파일 삭제·발행 없음).
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(test_pre_dispatch)" >&2; exit 0; }
 set -u
 
 REAL_HOOKS=${REAL_HOOKS:-$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)}
@@ -35,12 +39,15 @@ export REAL_HOOKS
 export REAL_GUARD
 
 # ---- cys 스텁: usage-event 만 기록, approval check 는 미서명(exit 1)으로 guard LOOSE deny 유지 ----
+# ★위치 무관 매칭(6d1871f 추적): guard 가 조회 argv 에 전역 옵션 `--socket <sock>` 을 서브커맨드
+#   **앞에** 삽입한다(`cys --socket <v> approval check …`) — `case "$1"` 고정 매칭은 서브커맨드를
+#   놓쳐 approval 이 `*) exit 0`(=서명됨)으로 흘러 deny 행렬이 무너진다(실측: block 기대 1→0).
 mkdir -p "$T/bin"
 cat >"$T/bin/cys" <<'STUB'
 #!/bin/sh
-case "$1" in
-  usage-event-stdin) cat >/dev/null 2>&1; echo usage-event >> "$CYS_LOG"; exit 0 ;;
-  approval) exit 1 ;;
+case " $* " in
+  *" usage-event-stdin "*) cat >/dev/null 2>&1; echo usage-event >> "$CYS_LOG"; exit 0 ;;
+  *" approval "*) exit 1 ;;
   *) exit 0 ;;
 esac
 STUB
@@ -50,6 +57,10 @@ export PATH="$T/bin:$PATH"
 # ---- 서브훅 래퍼(호출 로그 → 실제 pack 서브훅 exec) ----
 mkdir -p "$T/hooks"
 cp "$REAL_HOOKS/pre-dispatch.sh" "$T/hooks/pre-dispatch.sh"
+# ★공용 프리루드 동반 복사(T-0147-7 W1a): 스텁 훅 디렉터리는 팩 레이아웃을 **미러**해야 한다.
+#   _lib.sh 가 없으면 복사된 pre-dispatch.sh 가 loud-skip 으로 전면 강등돼(설치된 팩이 구버전이면
+#   2단 폴백도 못 잡는다) 이 하네스 전체가 무의미해진다(실측: 56/56 → 10/56).
+cp "$REAL_HOOKS/_lib.sh" "$T/hooks/_lib.sh" 2>/dev/null || true
 for name in cys-hook appbuild-gate grill-gate; do
   cat >"$T/hooks/$name.sh" <<WRAP
 #!/bin/sh
@@ -190,7 +201,7 @@ contains "stderr 경고 존재" "$(cat "$T/gerr")" "CYS_GUARD_HOOK 미설정"
 # ================ 시간 실측 before/after ================
 printf '\n================ 시간 실측 (N=8, 실제 pack 서브훅 직접·stub cys) ================\n'
 REAL_HOOKS="$REAL_HOOKS" REAL_GUARD="$REAL_GUARD" DISP="$REAL_HOOKS/pre-dispatch.sh" \
-python3 - <<'PY'
+"${CYS_PY:-python3}" - <<'PY'
 import os, subprocess, time
 RH=os.environ["REAL_HOOKS"]; RG=os.environ["REAL_GUARD"]; DISP=os.environ["DISP"]
 N=8

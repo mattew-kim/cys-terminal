@@ -6,24 +6,39 @@
 # 경로: SOUL·ROOT는 환경변수(CYS_SOUL·CYS_ROOT)로 오버라이드 가능. 미설정 시 portable 기본값(아래).
 set +e
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(inject-context)" >&2; exit 0; }
+
 INPUT=$(cat 2>/dev/null)
 [ -z "$INPUT" ] && exit 0
-# 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다(미해소 시 graceful degrade).
-CYS_PY="$(command -v python3 || command -v python || command -v py || echo python3)"
+# 인터프리터 해소는 프리루드(python3→python→py). 이 훅의 기존 계약(비어 있으면 안 됨)은
+# 자기 자리에서 명시 폴백한다 — 계약 무변경(미해소 시 graceful degrade).
+[ -n "$CYS_PY" ] || CYS_PY="python3"
 
 # JSON stdin 을 python 1회 스폰으로 source·cwd 동시 파싱(콜드스타트 절감 — 기존 2회 스폰 병합).
 # __CYS_END__ sentinel 로 cwd 공백 시에도 필드 경계를 결정론 보존($()가 후행 개행을 삭제해도
 # 마지막 줄이 sentinel 이라 두 read 가 정확히 source·cwd 를 집는다). 어떤 예외든 graceful(startup/'').
+# ★CR 제거(2026-08-10 Windows 실기 run 31404860883 근저원인): 네이티브 Windows python 은
+#   **파이프에도 \r\n** 을 쓴다 — 꼬리 CR 이 SOURCE 완전일치(case)와 CWD 상향탐색을 무너뜨린다.
+#   cwd 가 프로젝트 루트보다 깊으면 dirname 이 첫 상승에서 CR 성분을 버려 우연히 살고, cwd 가
+#   **루트 자신**이면 첫 -f 판정부터 전멸한다(작업기억 미발견). unix python 은 \n 만 내므로 무변.
 _PARSED=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try:
     d=json.load(sys.stdin)
     print(d.get('source','startup')); print(d.get('cwd',''))
 except Exception:
     print('startup'); print('')
-print('__CYS_END__')" 2>/dev/null)
+print('__CYS_END__')" 2>/dev/null | tr -d '\r')
 { IFS= read -r SOURCE; IFS= read -r CWD; } <<< "$_PARSED"
 [ -z "$SOURCE" ] && SOURCE="startup"
-case "$CWD" in /*) ;; *) CWD="" ;; esac  # 절대경로만 상향탐색 (상대·빈값은 fallback으로 — 무한루프 방지)
+# ── G19: 절대경로 게이트를 드라이브 경로까지 (Windows `C:\proj` cwd 공란화 해소) ──
+# 종전의 `/*` 전용 glob 게이트는 `C:\Users\x` 를 상대경로로 보고 CWD를 공란화해 SESSION_STATE
+# 상향탐색을 전면 불능화했다(Windows 전 설치). 드라이브/UNC 경로만 슬래시 정규화한 뒤
+# 프리루드 술어로 판정한다 — POSIX 경로는 바이트 무변경(회귀 0).
+CWD="$(cys_norm_cwd "$CWD")"
+cys_is_abs "$CWD" || CWD=""   # 절대경로만 상향탐색 (상대·빈값은 fallback으로 — 무한루프 방지)
 
 SOUL="${CYS_SOUL:-$HOME/.claude/soul.md}"
 [ -f "$SOUL" ] || SOUL="$HOME/.cys/pack/soul.md"   # 배포 기본 soul (일반 사용자)
@@ -63,12 +78,23 @@ fi
 
 # ---------- ★부서 소켓 노드: pack-dept round 정본만 (dept-recovery §8③·R1/R2/R3) ----------
 DIR="$CWD"; STATE=""; STATE_DIR=""; PREV=""; DEPT_CTX=""; DEPT_NO_STATE=""; DEPT_ROUND=""
-case "$CYS_PACK_DIR" in */pack-dept-dept-*) DEPT_CTX=1 ;; esac
-case "$CYS_SOCKET"   in */cys-dept-dept-*)  DEPT_CTX=1 ;; esac
+# ── G4+G20: 부서 레인 감지 글롭 수리 (명명 부서 + Windows 파이프·백슬래시) ──
+# 종전 글롭 `*/pack-dept-dept-*` · `*/cys-dept-dept-*` 는 부서명이 문자 그대로 `dept-N` 인
+# 경우만 매칭했다 → **명명 부서**(pack-dept-sales)는 부서 컨텍스트로 인식되지 않아 메인 레인
+# SESSION_STATE가 오주입되고(G4·격리 파괴), Windows named pipe(`\\.\pipe\cys-dept-sales`)·
+# 백슬래시 경로는 슬래시 글롭에 아예 걸리지 않았다(G20).
+# ★판정 SOT는 python `javis_bootstrap._pack_dept`(팩 **basename**이 `pack-dept-` 로 시작) ·
+#   `_socket_dept`(경로 **성분**이 `cys-dept-` 로 시작)다 — 두 술어를 정규화 후 그대로 미러한다
+#   (셸↔python 판정 일치 = parity 검체 H-WIN-3/H-PRED-6의 대상).
+_PACK_N="$(cys_norm_path "${CYS_PACK_DIR:-}")"
+_PACK_BASE="${_PACK_N%/}"; _PACK_BASE="${_PACK_BASE##*/}"
+_SOCK_N="$(cys_norm_path "${CYS_SOCKET:-}")"
+case "$_PACK_BASE" in pack-dept-?*) DEPT_CTX=1 ;; esac
+case "/$_SOCK_N" in */cys-dept-?*) DEPT_CTX=1 ;; esac
 if [ -n "$DEPT_CTX" ]; then
-  case "$CYS_PACK_DIR" in
-    */pack-dept-dept-*) DEPT_ROUND="$CYS_PACK_DIR/round" ;;
-    *)                  DEPT_NO_STATE=1 ;;
+  case "$_PACK_BASE" in
+    pack-dept-?*) DEPT_ROUND="$CYS_PACK_DIR/round" ;;
+    *)            DEPT_NO_STATE=1 ;;
   esac
   if [ -n "$DEPT_ROUND" ] && [ -f "$DEPT_ROUND/SESSION_STATE.md" ]; then
     STATE="$DEPT_ROUND/SESSION_STATE.md"; STATE_DIR="$DEPT_ROUND"
@@ -118,10 +144,38 @@ else
   OUT="${OUT}■ 작업기억 미발견 — 임의 추정 금지. 활성 프로젝트를 지정하라.\n\n"
 fi
 
+# ---------- ★도구 산출 스냅샷 주입 (BOOT_SNAPSHOT · 관측·비임무 — W-수리2 배선) ----------
+# 조건 3중: ①파일 존재 ②mtime 48h 이내(구식 스냅샷 오주입 차단) ③마스터 pane(javis_snapshot.py is-master exit 0).
+# 실패·부재·비마스터·구식은 조용히 생략(기존 주입 불변) · is-master는 cys_timeout_run 5초 캡(hang 차단).
+# 스냅샷은 SESSION_STATE 동일 _round에 산출된다(save-state.sh) — STATE_DIR은 master에서 프로젝트루트라 부적합(RSI_DIR 동일 규약).
+# mtime 판정은 python 경유(Windows find.exe 충돌·-mmin 가정 회피) · 경로는 cygpath 변환(CHK·GATE 동일 규약).
+if [ -n "$STATE" ]; then
+  SNAP="$(dirname "$STATE")/BOOT_SNAPSHOT.md"
+  SNAP_PY="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_snapshot.py"
+  if command -v cygpath >/dev/null 2>&1; then
+    SNAP="$(cygpath -w "$SNAP" 2>/dev/null || printf '%s' "$SNAP")"
+    SNAP_PY="$(cygpath -w "$SNAP_PY" 2>/dev/null || printf '%s' "$SNAP_PY")"
+  fi
+  if [ -f "$SNAP" ] && [ -f "$SNAP_PY" ] \
+     && "$CYS_PY" -c "import os,sys,time
+try: sys.exit(0 if (time.time()-os.path.getmtime(sys.argv[1]))<172800 else 1)
+except Exception: sys.exit(1)" "$SNAP" 2>/dev/null \
+     && cys_timeout_run 5 "$CYS_PY" "$SNAP_PY" is-master >/dev/null 2>&1; then
+    OUT="${OUT}■ 도구 산출 스냅샷(BOOT_SNAPSHOT · 관측·비임무 — 임무 판정은 javis_mission status)\n"
+    # 도구 계약상 이미 ≤4KB — head -c 8192는 계약 위반 시 컨텍스트 예산 보호용 방어 캡(SESSION_STATE 발췌 동일 파이프라인).
+    # 말미 tr -d '\r' — 네이티브 Windows python(_gate) 파이프 CRLF 방어(상단 :33 기존 규약과 동일).
+    OUT="${OUT}$(cat "$SNAP" | _gate | head -c 8192 | sed 's/\\/\\\\/g' | tr -d '\r')\n\n"
+  fi
+fi
+
 # ---------- ★동일 cwd 다중 세션 감지 (위험 #3: SESSION_STATE 편집 race 방어) ----------
 # 같은 작업폴더(CWD)에서 도는 살아있는 claude 세션을 lsof로 실시간 카운트. 2개+면 경고.
+# ── G33: 계측기 자체가 대상을 못 재던 결함 수리 ──
+# 종전 `lsof -c node` 는 **node로 실행되는 claude**만 셌다. claude Code는 네이티브 바이너리
+# (comm=claude)로 설치되는 경로가 주류라 이 경고는 상시 불발이었다(계측기 타당성 실패 — MEMORY
+# '디버깅 계측 타당성 게이트'와 동일 클래스). `-c` 는 반복 지정이 OR이라 스폰 1회로 둘 다 센다.
 if command -v lsof >/dev/null 2>&1 && [ -n "$CWD" ]; then
-  SHARE=$(lsof -c node -d cwd -Fn 2>/dev/null | grep -cxF "n$CWD")
+  SHARE=$(lsof -c node -c claude -d cwd -Fn 2>/dev/null | grep -cxF "n$CWD")
   if [ "${SHARE:-0}" -ge 2 ]; then
     OUT="${OUT}⚠ 같은 작업폴더($(_esc "$CWD"))에서 동시에 도는 claude 세션이 ${SHARE}개 감지됨 — SESSION_STATE 편집 충돌(race) 위험. 작업기억은 한 세션에서만 편집하고, 나머지는 읽기 전용으로 쓸 것.\n"
   fi
@@ -147,7 +201,7 @@ fi
 
 # ---------- 복원 모드 신호 (순환의존 해소 — 모순 1) ----------
 case "$SOURCE" in
-  startup|resume) OUT="${OUT}▶ 복원 모드(source=$SOURCE): RECOVERY.md 절차 실행 → G2 실측 대조(git·pane·server) → 미해결 게이트부터 재개.\n";;
+  startup|resume) OUT="${OUT}▶ 복원 모드(source=$SOURCE): RECOVERY.md 절차 실행 → G2 실측 대조(git·pane·server) → 배달 원장 다이제스트(BOOT_SNAPSHOT.md 있으면 그것 · 귀속 판별은 MASTER_DIRECTIVE '귀속 판별' 절(절이 없으면 constitution 병합 대기 — cys pack-merge 승인 필요)) → 미해결 게이트부터 재개.\n";;
   clear)          OUT="${OUT}▶ 작업 계속(source=clear): 위 작업기억 이어서 진행.\n";;
   compact)        OUT="${OUT}▶ 압축 직후(source=compact): 작업기억 보충 완료. 진행 중 작업 계속.\n";;
 esac
@@ -165,6 +219,16 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]
       OUT="${OUT}▶ RSI 집행(2026-06-07): auto-Elevate 전 rsi-gate(_round/autopilot/rsi-gate.sh)로 EFEC/AMI 기계검증(exit0 허가·exit2 proposal강등). 상세 RSI_PROTOCOL §4.2 EFEC 일가.\n\n"
     fi
   fi
+fi
+
+# ---------- ★계측(조건 12 · Phase1 B2): 주입 총 바이트 .state_log 1줄 — baseline 실측 확보 ----------
+# graceful: STATE(_round) 미확정이면 스킵 · 기록 실패도 주입 자체에 무영향.
+# G7f: 그룹화 { ...; } 2>/dev/null — `cmd >> f 2>/dev/null` 은 `>> f` 리다이렉션 자체가
+# 실패(권한·부재 디렉터리)하면 그 오류가 아직 미전환된 stderr 로 새어 주석 주장("무영향")과
+# 어긋난다. 그룹의 stderr 를 먼저 /dev/null 로 돌려 리다이렉션 실패까지 무음 흡수한다.
+if [ -n "$STATE" ]; then
+  INJ_BYTES=$(printf '%b' "$OUT" | wc -c | tr -d ' ')
+  { echo "$(date -Iseconds 2>/dev/null || date)	SessionStart-inject	source=$SOURCE bytes=${INJ_BYTES:-0}" >> "$(dirname "$STATE")/.state_log"; } 2>/dev/null
 fi
 
 printf '%b' "$OUT"
