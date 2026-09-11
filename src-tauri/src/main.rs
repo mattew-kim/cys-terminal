@@ -2181,12 +2181,46 @@ async fn install_pack_update(
             }),
         );
     }
+    // ★규칙2-4(오너 2026-08-22 업데이트 버튼 4원칙): preserve-gate가 남긴 병합대기(new-pending)를
+    // 순서대로 파악하고, AI 배치 3-way 병합으로 즉시 해소한다(오너 지시 — 사람 확인 없이 자동 적용).
+    // 해소 전/후 원장을 직접 대조해 병합 성공/실패 목록을 얻는다(사이드카 stdout 파싱보다 결정론적).
+    let pack_dir = cys::pack::pack_dir();
+    let pending_before = cys::pack::load_merge_pending(&pack_dir);
+    let merge_items: Vec<String> = pending_before
+        .iter()
+        .filter(|(_, e)| e.get("kind").and_then(|v| v.as_str()) == Some("new-pending"))
+        .map(|(rel, _)| rel.clone())
+        .collect();
+    let mut merge_merged: Vec<String> = Vec::new();
+    let mut merge_failed: Vec<String> = Vec::new();
+    if !merge_items.is_empty() {
+        let mut mcmd = std::process::Command::new(&cys);
+        mcmd.args(["pack-merge", "--all", "--ai", "--yes"]);
+        no_console(&mut mcmd);
+        let merge_ran = tokio::task::spawn_blocking(move || mcmd.output())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_some();
+        let pending_after = cys::pack::load_merge_pending(&pack_dir);
+        for rel in &merge_items {
+            if merge_ran && !pending_after.contains_key(rel) {
+                merge_merged.push(rel.clone());
+            } else {
+                // 사이드카 실행 자체 실패 또는 병합 후에도 원장에 남음(=충돌) — 미해소로 정직 보고.
+                merge_failed.push(rel.clone());
+            }
+        }
+    }
     let _ = app.emit(
         "pack-updated",
         json!({
             "pack_version": pack_version,
             "reinject_failed": failed,
             "reinject_deferred": deferred,
+            "merge_items": merge_items,
+            "merge_merged": merge_merged,
+            "merge_failed": merge_failed,
         }),
     );
     Ok(pack_version)

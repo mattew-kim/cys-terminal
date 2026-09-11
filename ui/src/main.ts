@@ -4085,7 +4085,14 @@ async function start() {
       stickyToast("upd-pack", "feed", "🔄 무중단 적용 중", "서명검증 → 다운로드 → 원자적 팩 교체 → 노드 reinject…");
   });
   await listen("pack-updated", (e) => {
-    const p = (e.payload ?? {}) as { pack_version?: string; reinject_failed?: number; reinject_deferred?: number };
+    const p = (e.payload ?? {}) as {
+      pack_version?: string;
+      reinject_failed?: number;
+      reinject_deferred?: number;
+      merge_items?: string[];
+      merge_merged?: string[];
+      merge_failed?: string[];
+    };
     packUpdateAvailable = null;
     dismissToast("upd-pack"); // 진행 토스트를 내리고 아래 완료 토스트로 교대.
     const badge = document.getElementById("update-badge")!;
@@ -4104,6 +4111,25 @@ async function start() {
         "watchdog",
         "✅ 팩 업데이트 완료",
         `팩 ${p.pack_version ?? ""} 적용 — 세션 유지·노드 reinject 완료(재시작 없음).`,
+      );
+    }
+    // ★규칙2-4(오너 2026-08-22): 커스터마이징과 충돌하는 항목을 순서대로 보여주고, 자동 AI 배치
+    // 병합 결과(성공/실패)를 알린다 — install_pack_update가 이미 --all --ai --yes 로 해소를 시도했다.
+    const mergedList = p.merge_merged ?? [];
+    const failedList = p.merge_failed ?? [];
+    if (mergedList.length > 0 || failedList.length > 0) {
+      const lines: string[] = [];
+      lines.push(`설정 충돌 항목 ${p.merge_items?.length ?? 0}건: ${(p.merge_items ?? []).join(", ")}`);
+      if (mergedList.length) lines.push(`✅ 자동 병합 ${mergedList.length}건: ${mergedList.join(", ")}`);
+      if (failedList.length)
+        lines.push(
+          `⚠ 자동 병합 실패(수동 필요) ${failedList.length}건: ${failedList.join(", ")} — ` +
+            `cys pack-merge --file <파일> 로 직접 해소하세요`,
+        );
+      toast(
+        failedList.length ? "health" : "watchdog",
+        failedList.length ? "⚠ 로컬 설정 일부 자동 병합 실패" : "✅ 로컬 설정 자동 병합 완료",
+        lines.join("\n"),
       );
     }
   });
